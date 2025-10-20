@@ -472,38 +472,85 @@ class WPlaceUtilsManager {
     }
   }
 
-  markPixelPainted(x, y, regionX = 0, regionY = 0) {
-    const actualX = x + regionX;
-    const actualY = y + regionY;
+  _calculateLocalPixelCoords(tilePixelX, tilePixelY, regionX = 0, regionY = 0) {
+    const state = window.state || {};
+    const tileSize = window.CONFIG?.TILE_SIZE || 1000;
+    const baseRegion = state.region || { x: 0, y: 0 };
+    const startPosition = state.startPosition || { x: 0, y: 0 };
 
-    if (
-      window.state.paintedMap &&
-      window.state.paintedMap[actualY] &&
-      actualX >= 0 &&
-      actualX < window.state.paintedMap[actualY].length
-    ) {
-      window.state.paintedMap[actualY][actualX] = true;
-    }
+    const baseAbsX = (baseRegion.x || 0) * tileSize + (startPosition.x || 0);
+    const baseAbsY = (baseRegion.y || 0) * tileSize + (startPosition.y || 0);
+
+    const absoluteX = regionX * tileSize + tilePixelX;
+    const absoluteY = regionY * tileSize + tilePixelY;
+
+    return {
+      localX: absoluteX - baseAbsX,
+      localY: absoluteY - baseAbsY,
+    };
   }
 
-  isPixelPainted(x, y, regionX = 0, regionY = 0) {
-    const actualX = x + regionX;
-    const actualY = y + regionY;
+  markPixelPainted(x, y, regionX = 0, regionY = 0, localCoords = null) {
+    const map = window.state?.paintedMap;
+    if (!Array.isArray(map)) return;
+
+    let localX;
+    let localY;
 
     if (
-      window.state.paintedMap &&
-      window.state.paintedMap[actualY] &&
-      actualX >= 0 &&
-      actualX < window.state.paintedMap[actualY].length
+      localCoords &&
+      Number.isFinite(localCoords.localX) &&
+      Number.isFinite(localCoords.localY)
     ) {
-      return window.state.paintedMap[actualY][actualX];
+      ({ localX, localY } = localCoords);
+    } else {
+      ({ localX, localY } = this._calculateLocalPixelCoords(x, y, regionX, regionY));
     }
-    return false;
+
+    localX = Math.trunc(localX);
+    localY = Math.trunc(localY);
+
+    if (localX < 0 || localY < 0) return;
+    if (localY >= map.length) return;
+
+    const row = map[localY];
+    if (!Array.isArray(row) || localX >= row.length) return;
+
+    row[localX] = true;
+  }
+
+  isPixelPainted(x, y, regionX = 0, regionY = 0, localCoords = null) {
+    const map = window.state?.paintedMap;
+    if (!Array.isArray(map)) return false;
+
+    let localX;
+    let localY;
+
+    if (
+      localCoords &&
+      Number.isFinite(localCoords.localX) &&
+      Number.isFinite(localCoords.localY)
+    ) {
+      ({ localX, localY } = localCoords);
+    } else {
+      ({ localX, localY } = this._calculateLocalPixelCoords(x, y, regionX, regionY));
+    }
+
+    localX = Math.trunc(localX);
+    localY = Math.trunc(localY);
+
+    if (localX < 0 || localY < 0) return false;
+    if (localY >= map.length) return false;
+
+    const row = map[localY];
+    if (!Array.isArray(row) || localX >= row.length) return false;
+
+    return Boolean(row[localX]);
   }
 
   // Alias for isPixelPainted - used in pre-filtering logic
-  isPixelMarkedPainted(x, y, regionX = 0, regionY = 0) {
-    return this.isPixelPainted(x, y, regionX, regionY);
+  isPixelMarkedPainted(x, y, regionX = 0, regionY = 0, localCoords = null) {
+    return this.isPixelPainted(x, y, regionX, regionY, localCoords);
   }
 
   // Smart save

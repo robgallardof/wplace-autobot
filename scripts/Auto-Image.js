@@ -1977,8 +1977,8 @@ localStorage.removeItem("lp");
     formatTime: (ms) => window.globalUtilsManager ? window.globalUtilsManager.formatTime(ms) : `${Math.floor(ms / 1000)}s`,
     calculateEstimatedTime: (remainingPixels, charges, cooldown) => window.globalUtilsManager ? window.globalUtilsManager.calculateEstimatedTime(remainingPixels, charges, cooldown) : 0,
     initializePaintedMap: (width, height) => window.globalUtilsManager ? window.globalUtilsManager.initializePaintedMap(width, height) : console.log('Painted map not available'),
-    markPixelPainted: (x, y, regionX, regionY) => window.globalUtilsManager ? window.globalUtilsManager.markPixelPainted(x, y, regionX, regionY) : false,
-    isPixelPainted: (x, y, regionX, regionY) => window.globalUtilsManager ? window.globalUtilsManager.isPixelPainted(x, y, regionX, regionY) : false,
+    markPixelPainted: (...args) => window.globalUtilsManager ? window.globalUtilsManager.markPixelPainted(...args) : false,
+    isPixelPainted: (...args) => window.globalUtilsManager ? window.globalUtilsManager.isPixelPainted(...args) : false,
     shouldAutoSave: () => window.globalUtilsManager ? window.globalUtilsManager.shouldAutoSave() : false,
     performSmartSave: () => window.globalUtilsManager ? window.globalUtilsManager.performSmartSave() : false,
     packPaintedMapToBase64: (paintedMap, width, height) => window.globalUtilsManager ? window.globalUtilsManager.packPaintedMapToBase64(paintedMap, width, height) : null,
@@ -8662,9 +8662,10 @@ localStorage.removeItem("lp");
         const pixelY = absY % 1000;
         const absoluteTileX = regionX + adderX;
         const absoluteTileY = regionY + adderY;
+        const localCoords = { localX: x, localY: y };
 
         // Check if already marked as painted in local map
-        if (Utils.isPixelPainted(x, y, absoluteTileX, absoluteTileY)) {
+        if (Utils.isPixelPainted(pixelX, pixelY, absoluteTileX, absoluteTileY, localCoords)) {
           detectedPixels++;
           continue;
         }
@@ -8700,10 +8701,10 @@ localStorage.removeItem("lp");
 
                 if (isAlreadyPainted) {
                   // Check if pixel is already marked as painted to avoid double counting
-                  if (!Utils.isPixelPainted(x, y, absoluteTileX, absoluteTileY)) {
+                  if (!Utils.isPixelPainted(pixelX, pixelY, absoluteTileX, absoluteTileY, localCoords)) {
                     // Mark as painted in the map but DO NOT increment progress counter
                     // Progress counter should only reflect actual painting sequence position
-                    Utils.markPixelPainted(x, y, absoluteTileX, absoluteTileY);
+                    Utils.markPixelPainted(pixelX, pixelY, absoluteTileX, absoluteTileY, localCoords);
                     detectedPixels++;
                   } else {
                     // Pixel already tracked, just count it for detection stats
@@ -8981,7 +8982,10 @@ localStorage.removeItem("lp");
       console.log(`📊 Added ${actuallyPaintedCount} painted pixels to progress (total: ${state.paintedPixels})`);
 
       pixelBatch.pixels.forEach((p) => {
-        Utils.markPixelPainted(p.x, p.y, pixelBatch.regionX, pixelBatch.regionY);
+        Utils.markPixelPainted(p.x, p.y, pixelBatch.regionX, pixelBatch.regionY, {
+          localX: p.localX,
+          localY: p.localY,
+        });
       });
 
       // Update last painted position to the last pixel in the successful batch
@@ -9249,6 +9253,7 @@ localStorage.removeItem("lp");
           let adderY = Math.floor(absY / 1000);
           let pixelX = absX % 1000;
           let pixelY = absY % 1000;
+          const localCoords = { localX: x, localY: y };
 
           try {
             const tilePixelRGBA = await overlayManager.getTilePixelColor(
@@ -9269,7 +9274,7 @@ localStorage.removeItem("lp");
                 alreadyPaintedCount++;
                 // Mark as painted in map but DO NOT increment progress counter
                 // Progress should only reflect actual painting sequence position
-                Utils.markPixelPainted(x, y, regionX + adderX, regionY + adderY);
+                Utils.markPixelPainted(pixelX, pixelY, regionX + adderX, regionY + adderY, localCoords);
                 continue; // Skip already painted pixels
               }
             }
@@ -9310,8 +9315,11 @@ localStorage.removeItem("lp");
           let absY = startY + y;
           let adderX = Math.floor(absX / 1000);
           let adderY = Math.floor(absY / 1000);
+          let pixelX = absX % 1000;
+          let pixelY = absY % 1000;
+          const localCoords = { localX: x, localY: y };
 
-          if (!Utils.isPixelPainted(x, y, regionX + adderX, regionY + adderY)) {
+          if (!Utils.isPixelPainted(pixelX, pixelY, regionX + adderX, regionY + adderY, localCoords)) {
             eligibleCoords.push([x, y, targetPixelInfo]);
           }
         }
@@ -9433,9 +9441,12 @@ localStorage.removeItem("lp");
         let adderY = Math.floor(absY / 1000);
         let pixelX = absX % 1000;
         let pixelY = absY % 1000;
+        const tileRegionX = regionX + adderX;
+        const tileRegionY = regionY + adderY;
+        const localCoords = { localX: x, localY: y };
 
         // CRITICAL FIX: Always check if pixel is already painted (both locally and on canvas)
-        if (Utils.isPixelPainted(x, y, regionX + adderX, regionY + adderY)) {
+        if (Utils.isPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords)) {
           console.log(`⏭️ Skipping already painted pixel at (${x}, ${y}) - marked in local map`);
           continue; // Skip already painted pixels
         }
@@ -9443,8 +9454,8 @@ localStorage.removeItem("lp");
         // REAL-TIME CANVAS CHECK: Verify against actual canvas state to prevent overpainting
         try {
           const existingColorRGBA = await overlayManager.getTilePixelColor(
-            regionX + adderX,
-            regionY + adderY,
+            tileRegionX,
+            tileRegionY,
             pixelX,
             pixelY
           ).catch(() => null);
@@ -9462,7 +9473,7 @@ localStorage.removeItem("lp");
               console.log(`✅ Pixel at (${x}, ${y}) already has correct color (${existingMappedColor.id}) - marking as painted`);
               // Mark it as painted in local map but DO NOT increment progress counter
               // Progress should only reflect actual painting sequence position
-              Utils.markPixelPainted(x, y, regionX + adderX, regionY + adderY);
+              Utils.markPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
               continue; // Skip painting this pixel
             }
           }
@@ -9476,8 +9487,8 @@ localStorage.removeItem("lp");
         // Set up pixel batch for new region if needed
         if (
           !pixelBatch ||
-          pixelBatch.regionX !== regionX + adderX ||
-          pixelBatch.regionY !== regionY + adderY
+          pixelBatch.regionX !== tileRegionX ||
+          pixelBatch.regionY !== tileRegionY
         ) {
           if (pixelBatch && pixelBatch.pixels.length > 0) {
             console.log(`🌍 Sending region-change batch with ${pixelBatch.pixels.length} pixels`);
@@ -9491,8 +9502,8 @@ localStorage.removeItem("lp");
           }
 
           pixelBatch = {
-            regionX: regionX + adderX,
-            regionY: regionY + adderY,
+            regionX: tileRegionX,
+            regionY: tileRegionY,
             pixels: [],
           };
         }
