@@ -2365,25 +2365,70 @@
             }
         },
 
-        markPixelPainted: (x, y, regionX = 0, regionY = 0) => {
-            const actualX = x + regionX;
-            const actualY = y + regionY;
+        markPixelPainted: (x, y, regionX = 0, regionY = 0, localCoords = null) => {
+            const map = state.paintedMap;
+            if (!Array.isArray(map)) return;
 
-            if (state.paintedMap && state.paintedMap[actualY] &&
-                actualX >= 0 && actualX < state.paintedMap[actualY].length) {
-                state.paintedMap[actualY][actualX] = true;
+            let localX;
+            let localY;
+
+            if (localCoords && Number.isFinite(localCoords.localX) && Number.isFinite(localCoords.localY)) {
+                ({ localX, localY } = localCoords);
+            } else {
+                const tileSize = (window.CONFIG && window.CONFIG.TILE_SIZE) || 1000;
+                const baseRegion = state.region || { x: 0, y: 0 };
+                const startPos = state.startPosition || { x: 0, y: 0 };
+                const baseAbsX = (baseRegion.x || 0) * tileSize + (startPos.x || 0);
+                const baseAbsY = (baseRegion.y || 0) * tileSize + (startPos.y || 0);
+                const absoluteX = regionX * tileSize + x;
+                const absoluteY = regionY * tileSize + y;
+                localX = absoluteX - baseAbsX;
+                localY = absoluteY - baseAbsY;
             }
+
+            localX = Math.trunc(localX);
+            localY = Math.trunc(localY);
+
+            if (localX < 0 || localY < 0) return;
+            if (localY >= map.length) return;
+
+            const row = map[localY];
+            if (!Array.isArray(row) || localX >= row.length) return;
+
+            row[localX] = true;
         },
 
-        isPixelPainted: (x, y, regionX = 0, regionY = 0) => {
-            const actualX = x + regionX;
-            const actualY = y + regionY;
+        isPixelPainted: (x, y, regionX = 0, regionY = 0, localCoords = null) => {
+            const map = state.paintedMap;
+            if (!Array.isArray(map)) return false;
 
-            if (state.paintedMap && state.paintedMap[actualY] &&
-                actualX >= 0 && actualX < state.paintedMap[actualY].length) {
-                return state.paintedMap[actualY][actualX];
+            let localX;
+            let localY;
+
+            if (localCoords && Number.isFinite(localCoords.localX) && Number.isFinite(localCoords.localY)) {
+                ({ localX, localY } = localCoords);
+            } else {
+                const tileSize = (window.CONFIG && window.CONFIG.TILE_SIZE) || 1000;
+                const baseRegion = state.region || { x: 0, y: 0 };
+                const startPos = state.startPosition || { x: 0, y: 0 };
+                const baseAbsX = (baseRegion.x || 0) * tileSize + (startPos.x || 0);
+                const baseAbsY = (baseRegion.y || 0) * tileSize + (startPos.y || 0);
+                const absoluteX = regionX * tileSize + x;
+                const absoluteY = regionY * tileSize + y;
+                localX = absoluteX - baseAbsX;
+                localY = absoluteY - baseAbsY;
             }
-            return false;
+
+            localX = Math.trunc(localX);
+            localY = Math.trunc(localY);
+
+            if (localX < 0 || localY < 0) return false;
+            if (localY >= map.length) return false;
+
+            const row = map[localY];
+            if (!Array.isArray(row) || localX >= row.length) return false;
+
+            return Boolean(row[localX]);
         },
 
         // Smart save - only save if significant changes
@@ -7367,7 +7412,10 @@
                                 pixelBatch.pixels.forEach((p) => {
                                     state.paintedPixels++;
                                     // Mark pixel as painted in map
-                                    Utils.markPixelPainted(p.x, p.y, pixelBatch.regionX, pixelBatch.regionY);
+                                    Utils.markPixelPainted(p.x, p.y, pixelBatch.regionX, pixelBatch.regionY, {
+                                        localX: p.localX,
+                                        localY: p.localY,
+                                    });
                                 });
                                 state.currentCharges -= pixelBatch.pixels.length;
                                 updateUI("paintingProgress", "default", {
@@ -7439,7 +7487,10 @@
                             pixelBatch.pixels.forEach((pixel) => {
                                 state.paintedPixels++;
                                 // Mark pixel as painted in map
-                                Utils.markPixelPainted(pixel.x, pixel.y, pixelBatch.regionX, pixelBatch.regionY);
+                                Utils.markPixelPainted(pixel.x, pixel.y, pixelBatch.regionX, pixelBatch.regionY, {
+                                    localX: pixel.localX,
+                                    localY: pixel.localY,
+                                });
                             })
 
                             state.currentCharges -= pixelBatch.pixels.length;
@@ -7548,7 +7599,10 @@
                     pixelBatch.pixels.forEach((pixel) => {
                         state.paintedPixels++;
                         // Mark pixel as painted in map
-                        Utils.markPixelPainted(pixel.x, pixel.y, pixelBatch.regionX, pixelBatch.regionY);
+                        Utils.markPixelPainted(pixel.x, pixel.y, pixelBatch.regionX, pixelBatch.regionY, {
+                            localX: pixel.localX,
+                            localY: pixel.localY,
+                        });
                     })
                     state.currentCharges -= pixelBatch.pixels.length;
                     // Final save with painted map
