@@ -490,6 +490,14 @@ class WPlaceUtilsManager {
     };
   }
 
+  calculateLocalPixelCoords(tilePixelX, tilePixelY, regionX = 0, regionY = 0) {
+    const coords = this._calculateLocalPixelCoords(tilePixelX, tilePixelY, regionX, regionY);
+    return {
+      localX: Number.isFinite(coords.localX) ? Math.trunc(coords.localX) : NaN,
+      localY: Number.isFinite(coords.localY) ? Math.trunc(coords.localY) : NaN,
+    };
+  }
+
   markPixelPainted(x, y, regionX = 0, regionY = 0, localCoords = null) {
     const map = window.state?.paintedMap;
     if (!Array.isArray(map)) return;

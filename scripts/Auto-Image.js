@@ -1100,6 +1100,13 @@ localStorage.removeItem("lp");
   const remoteTileCache = new Map();
   const REMOTE_TILE_CACHE_TTL = 5000; // milliseconds before forcing a refresh when sampling
 
+  const invalidatedPixelQueue = [];
+  const invalidatedPixelSet = new Set();
+  let canvasMonitorTimer = null;
+  let canvasMonitorTickInFlight = false;
+  let canvasMonitorCursor = 0;
+  let canvasMonitorActive = false;
+
   let _updateResizePreview = () => { };
   let _resizeDialogCleanup = null;
 
@@ -1736,6 +1743,7 @@ localStorage.removeItem("lp");
         // Reset session-specific flags when loading a new save file
         window.state.preFilteringDone = false;
         window.state.progressResetDone = false;
+        clearInvalidatedPixelQueue(true);
         console.log('🔄 Reset session flags for new save file load');
 
         console.log('✅ [DEBUG] Object.assign completed successfully');
@@ -7872,6 +7880,7 @@ localStorage.removeItem("lp");
 
           // Initialize painted map for tracking
           Utils.initializePaintedMap(width, height);
+          clearInvalidatedPixelQueue(true);
 
           // New image: clear previous resize settings
           state.resizeSettings = null;
@@ -7981,6 +7990,8 @@ localStorage.removeItem("lp");
           if (!restoreSuccess) {
             throw new Error('Failed to restore progress data');
           }
+
+          clearInvalidatedPixelQueue(true);
 
           // After loading, we need to enter position selection mode like when uploading images
           if (state.imageLoaded) {
@@ -8925,9 +8936,13 @@ localStorage.removeItem("lp");
     pixelX,
     pixelY,
     expectedColorId,
-    localCoords
+    localCoords,
+    options = {}
   ) {
-    if (!Utils.isPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords)) {
+    const { enqueueInvalidation = false } = options;
+
+    const wasTracked = Utils.isPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
+    if (!wasTracked) {
       return false;
     }
 
@@ -8957,6 +8972,18 @@ localStorage.removeItem("lp");
     }
 
     Utils.unmarkPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
+
+    if (enqueueInvalidation) {
+      enqueueInvalidatedPixel(
+        tileRegionX,
+        tileRegionY,
+        pixelX,
+        pixelY,
+        expectedColorId,
+        localCoords
+      );
+    }
+
     return false;
   }
 
@@ -8997,6 +9024,197 @@ localStorage.removeItem("lp");
     }
 
     return existingMappedColor.id === expectedColorId;
+  }
+
+  function enqueueInvalidatedPixel(
+    tileRegionX,
+    tileRegionY,
+    pixelX,
+    pixelY,
+    expectedColorId,
+    localCoords = null
+  ) {
+    if (!state || !state.imageData || !Array.isArray(state.paintedMap)) {
+      return;
+    }
+
+    const { width, height } = state.imageData;
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+      return;
+    }
+
+    let localX;
+    let localY;
+
+    if (
+      localCoords &&
+      Number.isFinite(localCoords.localX) &&
+      Number.isFinite(localCoords.localY)
+    ) {
+      localX = Math.trunc(localCoords.localX);
+      localY = Math.trunc(localCoords.localY);
+    } else if (Utils && typeof Utils.calculateLocalPixelCoords === 'function') {
+      const coords = Utils.calculateLocalPixelCoords(pixelX, pixelY, tileRegionX, tileRegionY);
+      localX = coords?.localX;
+      localY = coords?.localY;
+    } else {
+      const tileSize = window.CONFIG?.TILE_SIZE || 1000;
+      const baseRegion = state.region || { x: 0, y: 0 };
+      const startPosition = state.startPosition || { x: 0, y: 0 };
+      const baseAbsX = (baseRegion.x || 0) * tileSize + (startPosition.x || 0);
+      const baseAbsY = (baseRegion.y || 0) * tileSize + (startPosition.y || 0);
+      const absoluteX = tileRegionX * tileSize + pixelX;
+      const absoluteY = tileRegionY * tileSize + pixelY;
+      localX = absoluteX - baseAbsX;
+      localY = absoluteY - baseAbsY;
+    }
+
+    if (!Number.isFinite(localX) || !Number.isFinite(localY)) {
+      return;
+    }
+
+    localX = Math.trunc(localX);
+    localY = Math.trunc(localY);
+
+    if (localX < 0 || localY < 0 || localX >= width || localY >= height) {
+      return;
+    }
+
+    const key = `${localX},${localY}`;
+    if (invalidatedPixelSet.has(key)) {
+      return;
+    }
+
+    invalidatedPixelSet.add(key);
+    invalidatedPixelQueue.push({
+      localX,
+      localY,
+      targetColorId: expectedColorId,
+    });
+  }
+
+  function dequeueInvalidatedPixel() {
+    while (invalidatedPixelQueue.length > 0) {
+      const entry = invalidatedPixelQueue.shift();
+      if (!entry) continue;
+      const key = `${entry.localX},${entry.localY}`;
+      invalidatedPixelSet.delete(key);
+      return entry;
+    }
+    return null;
+  }
+
+  function clearInvalidatedPixelQueue(resetCursor = false) {
+    invalidatedPixelQueue.length = 0;
+    invalidatedPixelSet.clear();
+    if (resetCursor) {
+      canvasMonitorCursor = 0;
+    }
+  }
+
+  async function scanPaintedPixelsBatch(batchSize = 150) {
+    if (
+      !state ||
+      !state.imageData ||
+      !Array.isArray(state.paintedMap) ||
+      !state.imageData.width ||
+      !state.imageData.height
+    ) {
+      return;
+    }
+
+    const { width, height } = state.imageData;
+    const totalPixels = width * height;
+    if (!Number.isFinite(totalPixels) || totalPixels <= 0) {
+      return;
+    }
+
+    const startPosition = state.startPosition || { x: 0, y: 0 };
+    const region = state.region || { x: 0, y: 0 };
+
+    const checks = Math.min(batchSize, totalPixels);
+    for (let i = 0; i < checks; i++) {
+      const flatIndex = canvasMonitorCursor % totalPixels;
+      canvasMonitorCursor = (canvasMonitorCursor + 1) % totalPixels;
+
+      const localX = flatIndex % width;
+      const localY = Math.floor(flatIndex / width);
+      const row = state.paintedMap[localY];
+      if (!row || !row[localX]) {
+        continue;
+      }
+
+      const eligibility = checkPixelEligibility(localX, localY);
+      if (!eligibility.eligible) {
+        continue;
+      }
+
+      const absX = startPosition.x + localX;
+      const absY = startPosition.y + localY;
+
+      const tileOffsetX = Math.floor(absX / 1000);
+      const tileOffsetY = Math.floor(absY / 1000);
+      const pixelX = ((absX % 1000) + 1000) % 1000;
+      const pixelY = ((absY % 1000) + 1000) % 1000;
+      const tileRegionX = region.x + tileOffsetX;
+      const tileRegionY = region.y + tileOffsetY;
+
+      try {
+        await ensurePixelStateMatchesCanvas(
+          tileRegionX,
+          tileRegionY,
+          pixelX,
+          pixelY,
+          eligibility.mappedColorId,
+          { localX, localY },
+          { enqueueInvalidation: true }
+        );
+      } catch (e) {
+        console.debug('Canvas monitor check failed:', e.message);
+      }
+    }
+  }
+
+  function stopCanvasMonitor() {
+    canvasMonitorActive = false;
+    if (canvasMonitorTimer) {
+      clearTimeout(canvasMonitorTimer);
+      canvasMonitorTimer = null;
+    }
+  }
+
+  function startCanvasMonitor(intervalMs = 1200, batchSize = 150) {
+    if (canvasMonitorActive) {
+      return;
+    }
+
+    canvasMonitorActive = true;
+
+    const tick = async () => {
+      if (!canvasMonitorActive) {
+        canvasMonitorTickInFlight = false;
+        return;
+      }
+
+      if (canvasMonitorTickInFlight) {
+        canvasMonitorTimer = setTimeout(tick, intervalMs);
+        return;
+      }
+
+      canvasMonitorTickInFlight = true;
+      try {
+        await scanPaintedPixelsBatch(batchSize);
+      } catch (error) {
+        console.debug('Canvas monitor tick failed:', error?.message || error);
+      } finally {
+        canvasMonitorTickInFlight = false;
+        if (canvasMonitorActive) {
+          canvasMonitorTimer = setTimeout(tick, intervalMs);
+        }
+      }
+    };
+
+    canvasMonitorTimer = setTimeout(tick, intervalMs);
   }
 
   function generateCoordinates(width, height, mode, direction, snake, blockWidth, blockHeight, startFromX = 0, startFromY = 0) {
@@ -9252,6 +9470,8 @@ localStorage.removeItem("lp");
   async function processImage() {
     console.log('🚀 Starting auto-swap enabled painting workflow');
 
+    startCanvasMonitor();
+
     try {
       // Main painting cycle - repeats until image complete or stopped
       while (!state.stopFlag) {
@@ -9345,6 +9565,7 @@ localStorage.removeItem("lp");
         console.log('🔄 Cycle complete, starting next painting session');
       }
     } finally {
+      stopCanvasMonitor();
       await finalizePaintingProcess();
     }
   }
@@ -9353,6 +9574,7 @@ localStorage.removeItem("lp");
   async function executePaintingSession() {
     console.log('🎨 Starting painting session - using all charges until 0');
     remoteTileCache.clear();
+    canvasMonitorCursor = 0;
     const { width, height, pixels } = state.imageData;
     const { x: startX, y: startY } = state.startPosition;
     const { x: regionX, y: regionY } = state.region;
@@ -9611,8 +9833,42 @@ localStorage.removeItem("lp");
         console.log(`✅ Prepared ${pixelsToProcess.length} pixels for color-by-color painting`);
       }
 
-      // Paint eligible pixels (already pre-filtered, no duplicate checks)
-      outerLoop: for (const [x, y, targetPixelInfo] of pixelsToProcess) {
+      const coordsIterator = pixelsToProcess[Symbol.iterator]();
+      let iteratorResult = coordsIterator.next();
+      const initialLastPosition = state.lastPosition || { x: 0, y: 0 };
+      let lastSequentialCoord = {
+        x: Number.isFinite(initialLastPosition.x) ? initialLastPosition.x : 0,
+        y: Number.isFinite(initialLastPosition.y) ? initialLastPosition.y : 0,
+      };
+
+      while (!state.stopFlag) {
+        let workItem = dequeueInvalidatedPixel();
+
+        if (!workItem) {
+          if (iteratorResult.done) {
+            break;
+          }
+          const [baseX, baseY, baseInfo] = iteratorResult.value;
+          workItem = {
+            localX: baseX,
+            localY: baseY,
+            targetPixelInfo: baseInfo,
+          };
+          iteratorResult = coordsIterator.next();
+          lastSequentialCoord = { x: baseX, y: baseY };
+        }
+
+        const x = workItem.localX;
+        const y = workItem.localY;
+        let targetPixelInfo = workItem.targetPixelInfo;
+
+        if (!targetPixelInfo || !targetPixelInfo.eligible) {
+          targetPixelInfo = checkPixelEligibility(x, y);
+          if (!targetPixelInfo.eligible) {
+            continue;
+          }
+        }
+
         // Track current color being painted in color-by-color mode
         if (state.paintingOrder === 'color-by-color') {
           if (state.currentPaintingColor !== targetPixelInfo.mappedColorId) {
@@ -9620,7 +9876,7 @@ localStorage.removeItem("lp");
             const colorInfo = Object.values(CONFIG.COLOR_MAP).find(c => c.id === state.currentPaintingColor);
             const colorName = colorInfo ? colorInfo.name : `Color ${state.currentPaintingColor}`;
             console.log(`🎨 Now painting: ${colorName} (ID: ${state.currentPaintingColor})`);
-            
+
             // Update UI to show current color
             const statusDiv = document.getElementById('statusDiv');
             if (statusDiv) {
@@ -9644,11 +9900,11 @@ localStorage.removeItem("lp");
             console.log(`🎯 Sending last batch before stop with ${pixelBatch.pixels.length} pixels`);
             await flushPixelBatch(pixelBatch);
           }
-          state.lastPosition = { x, y };
+          state.lastPosition = { x: lastSequentialCoord.x, y: lastSequentialCoord.y };
           // Show paused coordinates in UI with proper translation template
-          // Use last painted position if available, otherwise use current position
-          const pausedX = state.lastPaintedPosition.x || x;
-          const pausedY = state.lastPaintedPosition.y || y;
+          // Use last painted position if available, otherwise use current sequential position
+          const pausedX = state.lastPaintedPosition.x || lastSequentialCoord.x || x;
+          const pausedY = state.lastPaintedPosition.y || lastSequentialCoord.y || y;
           updateUI('paintingPaused', 'warning', { x: pausedX, y: pausedY });
           console.log(`⏸️ Painting paused after last painted coordinates (${pausedX}, ${pausedY})`);
           return 'stopped';
@@ -9656,8 +9912,6 @@ localStorage.removeItem("lp");
 
         // Check if we have charges left (local count, no API call)
         if (state.displayCharges <= 0) {
-          // console.log("Try to buy paint charges");
-          // await purchase("paint_charges");
           await updateStats();
           if (state.displayCharges <= 0) {
             console.log('⚡ No charges left (local count), ending painting session');
@@ -9665,12 +9919,9 @@ localStorage.removeItem("lp");
               console.log(`🎯 Sending final batch with ${pixelBatch.pixels.length} pixels`);
               await flushPixelBatch(pixelBatch);
             }
-            state.lastPosition = { x, y };
+            state.lastPosition = { x: lastSequentialCoord.x, y: lastSequentialCoord.y };
             return 'charges_depleted';
           }
-          // else {
-          //   console.log(`🔋 Charges after purchase: ${state.displayCharges}, continuing painting`);
-          // }
         }
 
         let absX = startX + x;
