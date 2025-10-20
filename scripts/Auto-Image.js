@@ -1096,6 +1096,10 @@ localStorage.removeItem("lp");
   // Expose state globally for the utils manager and other modules
   window.state = state;
 
+  // Cache remote tile ImageData when we have to fetch them manually
+  const remoteTileCache = new Map();
+  const REMOTE_TILE_CACHE_TTL = 5000; // milliseconds before forcing a refresh when sampling
+
   let _updateResizePreview = () => { };
   let _resizeDialogCleanup = null;
 
@@ -1977,8 +1981,8 @@ localStorage.removeItem("lp");
     formatTime: (ms) => window.globalUtilsManager ? window.globalUtilsManager.formatTime(ms) : `${Math.floor(ms / 1000)}s`,
     calculateEstimatedTime: (remainingPixels, charges, cooldown) => window.globalUtilsManager ? window.globalUtilsManager.calculateEstimatedTime(remainingPixels, charges, cooldown) : 0,
     initializePaintedMap: (width, height) => window.globalUtilsManager ? window.globalUtilsManager.initializePaintedMap(width, height) : console.log('Painted map not available'),
-    markPixelPainted: (x, y, regionX, regionY) => window.globalUtilsManager ? window.globalUtilsManager.markPixelPainted(x, y, regionX, regionY) : false,
-    isPixelPainted: (x, y, regionX, regionY) => window.globalUtilsManager ? window.globalUtilsManager.isPixelPainted(x, y, regionX, regionY) : false,
+    markPixelPainted: (...args) => window.globalUtilsManager ? window.globalUtilsManager.markPixelPainted(...args) : false,
+    isPixelPainted: (...args) => window.globalUtilsManager ? window.globalUtilsManager.isPixelPainted(...args) : false,
     shouldAutoSave: () => window.globalUtilsManager ? window.globalUtilsManager.shouldAutoSave() : false,
     performSmartSave: () => window.globalUtilsManager ? window.globalUtilsManager.performSmartSave() : false,
     packPaintedMapToBase64: (paintedMap, width, height) => window.globalUtilsManager ? window.globalUtilsManager.packPaintedMapToBase64(paintedMap, width, height) : null,
@@ -7860,6 +7864,7 @@ localStorage.removeItem("lp");
           // Reset session-specific flags when a new image is loaded
           state.preFilteringDone = false;
           state.progressResetDone = false;
+          remoteTileCache.clear();
           console.log('🔄 Reset session flags for new image load');
 
           // Keep existing lastPosition to continue from where we left off
@@ -8662,16 +8667,43 @@ localStorage.removeItem("lp");
         const pixelY = absY % 1000;
         const absoluteTileX = regionX + adderX;
         const absoluteTileY = regionY + adderY;
-
-        // Check if already marked as painted in local map
-        if (Utils.isPixelPainted(x, y, absoluteTileX, absoluteTileY)) {
-          detectedPixels++;
-          continue;
-        }
+        const localCoords = { localX: x, localY: y };
 
         // Fast pixel color check using cached tile data
         const tileKey = `${absoluteTileX},${absoluteTileY}`;
         const tileImageData = tileDataCache.get(tileKey);
+
+        if (Utils.isPixelPainted(pixelX, pixelY, absoluteTileX, absoluteTileY, localCoords)) {
+          const matchesCachedTile = doesTileImageDataMatchColor(
+            tileImageData,
+            pixelX,
+            pixelY,
+            targetPixelInfo.mappedColorId
+          );
+
+          if (matchesCachedTile === true) {
+            detectedPixels++;
+            continue;
+          }
+
+          if (matchesCachedTile === false) {
+            Utils.unmarkPixelPainted(pixelX, pixelY, absoluteTileX, absoluteTileY, localCoords);
+          } else {
+            const stillCorrect = await ensurePixelStateMatchesCanvas(
+              absoluteTileX,
+              absoluteTileY,
+              pixelX,
+              pixelY,
+              targetPixelInfo.mappedColorId,
+              localCoords
+            );
+
+            if (stillCorrect) {
+              detectedPixels++;
+              continue;
+            }
+          }
+        }
 
         if (tileImageData) {
           try {
@@ -8696,14 +8728,12 @@ localStorage.removeItem("lp");
                   state.availableColors,
                   !state.paintUnavailablePixels
                 );
-                const isAlreadyPainted = existingMappedColor.id === targetPixelInfo.mappedColorId;
-
-                if (isAlreadyPainted) {
+                if (existingMappedColor && existingMappedColor.id === targetPixelInfo.mappedColorId) {
                   // Check if pixel is already marked as painted to avoid double counting
-                  if (!Utils.isPixelPainted(x, y, absoluteTileX, absoluteTileY)) {
+                  if (!Utils.isPixelPainted(pixelX, pixelY, absoluteTileX, absoluteTileY, localCoords)) {
                     // Mark as painted in the map but DO NOT increment progress counter
                     // Progress counter should only reflect actual painting sequence position
-                    Utils.markPixelPainted(x, y, absoluteTileX, absoluteTileY);
+                    Utils.markPixelPainted(pixelX, pixelY, absoluteTileX, absoluteTileY, localCoords);
                     detectedPixels++;
                   } else {
                     // Pixel already tracked, just count it for detection stats
@@ -8769,21 +8799,204 @@ localStorage.removeItem("lp");
       const ctx = canvas.getContext('2d');
 
       return new Promise((resolve, reject) => {
+        const objectUrl = URL.createObjectURL(blob);
         img.onload = () => {
           canvas.width = img.width;
           canvas.height = img.height;
           ctx.imageSmoothingEnabled = false;
           ctx.drawImage(img, 0, 0);
           const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          URL.revokeObjectURL(objectUrl);
           resolve(imageData);
         };
-        img.onerror = () => reject(new Error('Failed to load image'));
-        img.src = URL.createObjectURL(blob);
+        img.onerror = () => {
+          URL.revokeObjectURL(objectUrl);
+          reject(new Error('Failed to load image'));
+        };
+        img.src = objectUrl;
       });
     } catch (error) {
       console.error('Error processing tile blob:', error);
       return null;
     }
+  }
+
+  async function getCanvasPixelColor(tileX, tileY, pixelX, pixelY, options = {}) {
+    const { refresh = false } = options;
+    try {
+      const cachedColor = await overlayManager.getTilePixelColor(tileX, tileY, pixelX, pixelY);
+      if (cachedColor && Array.isArray(cachedColor)) {
+        return cachedColor;
+      }
+    } catch (error) {
+      console.warn(`Overlay pixel lookup failed for tile ${tileX},${tileY}:`, error.message);
+    }
+
+    const tileKey = `${tileX},${tileY}`;
+    const hadTileCached = remoteTileCache.has(tileKey);
+    let tileData = remoteTileCache.get(tileKey);
+    const isStale = tileData && Date.now() - tileData.timestamp > REMOTE_TILE_CACHE_TTL;
+
+    if (!tileData || refresh || isStale) {
+      const imageData = await downloadTileImageData(tileX, tileY);
+      if (!imageData) {
+        if (!tileData) {
+          return null;
+        }
+        if (refresh) {
+          return null;
+        }
+        // Failed refresh while using stale data - keep current cache but mark timestamp to avoid tight loops
+        tileData.timestamp = Date.now();
+      } else {
+        if (!hadTileCached && remoteTileCache.size > 64) {
+          remoteTileCache.clear();
+        }
+
+        tileData = {
+          width: imageData.width,
+          height: imageData.height,
+          data: new Uint8ClampedArray(imageData.data),
+          timestamp: Date.now(),
+        };
+        remoteTileCache.set(tileKey, tileData);
+
+        if (overlayManager && overlayManager.originalTilesData instanceof Map) {
+          try {
+            overlayManager.originalTilesData.set(tileKey, {
+              w: tileData.width,
+              h: tileData.height,
+              data: tileData.data,
+            });
+          } catch (e) {
+            console.debug('Could not prime overlay tile cache from remote fetch:', e.message);
+          }
+        }
+      }
+    }
+
+    if (!tileData.timestamp) {
+      tileData.timestamp = Date.now();
+    }
+
+    const clampX = Math.max(0, Math.min(tileData.width - 1, pixelX));
+    const clampY = Math.max(0, Math.min(tileData.height - 1, pixelY));
+    const idx = (clampY * tileData.width + clampX) * 4;
+    const data = tileData.data;
+    return [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
+  }
+
+  async function doesCanvasPixelMatchTargetColor(tileRegionX, tileRegionY, pixelX, pixelY, expectedColorId, options = {}) {
+    try {
+      const rgba = await getCanvasPixelColor(tileRegionX, tileRegionY, pixelX, pixelY, options);
+      if (!rgba || !Array.isArray(rgba)) {
+        return null;
+      }
+
+      const [er, eg, eb, ea = 255] = rgba;
+      const alphaThresh = state.customTransparencyThreshold || CONFIG.TRANSPARENCY_THRESHOLD;
+      if (ea < alphaThresh) {
+        return false;
+      }
+
+      const existingMappedColor = Utils.resolveColor(
+        [er, eg, eb],
+        state.availableColors,
+        !state.paintUnavailablePixels
+      );
+
+      if (!existingMappedColor || existingMappedColor.id == null) {
+        return false;
+      }
+
+      return existingMappedColor.id === expectedColorId;
+    } catch (error) {
+      console.warn(
+        `⚠️ Could not sample canvas pixel (${pixelX}, ${pixelY}) on tile ${tileRegionX},${tileRegionY}:`,
+        error.message
+      );
+      return null;
+    }
+  }
+
+  async function ensurePixelStateMatchesCanvas(
+    tileRegionX,
+    tileRegionY,
+    pixelX,
+    pixelY,
+    expectedColorId,
+    localCoords
+  ) {
+    if (!Utils.isPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords)) {
+      return false;
+    }
+
+    let matches = await doesCanvasPixelMatchTargetColor(
+      tileRegionX,
+      tileRegionY,
+      pixelX,
+      pixelY,
+      expectedColorId
+    );
+
+    if (matches === true) {
+      return true;
+    }
+
+    matches = await doesCanvasPixelMatchTargetColor(
+      tileRegionX,
+      tileRegionY,
+      pixelX,
+      pixelY,
+      expectedColorId,
+      { refresh: true }
+    );
+
+    if (matches === true) {
+      return true;
+    }
+
+    Utils.unmarkPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
+    return false;
+  }
+
+  function doesTileImageDataMatchColor(tileImageData, pixelX, pixelY, expectedColorId) {
+    if (!tileImageData) {
+      return null;
+    }
+
+    const { width, height, data } = tileImageData;
+    if (
+      pixelX < 0 ||
+      pixelY < 0 ||
+      pixelX >= width ||
+      pixelY >= height
+    ) {
+      return null;
+    }
+
+    const idx = (pixelY * width + pixelX) * 4;
+    const r = data[idx];
+    const g = data[idx + 1];
+    const b = data[idx + 2];
+    const a = data[idx + 3];
+    const alphaThresh = state.customTransparencyThreshold || CONFIG.TRANSPARENCY_THRESHOLD;
+
+    if (a < alphaThresh) {
+      return false;
+    }
+
+    const existingMappedColor = Utils.resolveColor(
+      [r, g, b],
+      state.availableColors,
+      !state.paintUnavailablePixels
+    );
+
+    if (!existingMappedColor || existingMappedColor.id == null) {
+      return false;
+    }
+
+    return existingMappedColor.id === expectedColorId;
   }
 
   function generateCoordinates(width, height, mode, direction, snake, blockWidth, blockHeight, startFromX = 0, startFromY = 0) {
@@ -8981,7 +9194,10 @@ localStorage.removeItem("lp");
       console.log(`📊 Added ${actuallyPaintedCount} painted pixels to progress (total: ${state.paintedPixels})`);
 
       pixelBatch.pixels.forEach((p) => {
-        Utils.markPixelPainted(p.x, p.y, pixelBatch.regionX, pixelBatch.regionY);
+        Utils.markPixelPainted(p.x, p.y, pixelBatch.regionX, pixelBatch.regionY, {
+          localX: p.localX,
+          localY: p.localY,
+        });
       });
 
       // Update last painted position to the last pixel in the successful batch
@@ -9015,6 +9231,8 @@ localStorage.removeItem("lp");
       await updateCurrentAccountInList();
       // Progress tracking removed from UI to reduce visual clutter
       Utils.performSmartSave();
+
+      remoteTileCache.delete(`${pixelBatch.regionX},${pixelBatch.regionY}`);
 
       if (CONFIG.PAINTING_SPEED_ENABLED && state.paintingSpeed > 0 && batchSize > 0) {
         const delayPerPixel = 1000 / state.paintingSpeed;
@@ -9134,6 +9352,7 @@ localStorage.removeItem("lp");
   // Phase 1: Execute a complete painting session using all available charges
   async function executePaintingSession() {
     console.log('🎨 Starting painting session - using all charges until 0');
+    remoteTileCache.clear();
     const { width, height, pixels } = state.imageData;
     const { x: startX, y: startY } = state.startPosition;
     const { x: regionX, y: regionY } = state.region;
@@ -9249,9 +9468,24 @@ localStorage.removeItem("lp");
           let adderY = Math.floor(absY / 1000);
           let pixelX = absX % 1000;
           let pixelY = absY % 1000;
+          const localCoords = { localX: x, localY: y };
 
           try {
-            const tilePixelRGBA = await overlayManager.getTilePixelColor(
+            const alreadySynced = await ensurePixelStateMatchesCanvas(
+              regionX + adderX,
+              regionY + adderY,
+              pixelX,
+              pixelY,
+              targetPixelInfo.mappedColorId,
+              localCoords
+            );
+
+            if (alreadySynced) {
+              alreadyPaintedCount++;
+              continue;
+            }
+
+            const tilePixelRGBA = await getCanvasPixelColor(
               regionX + adderX,
               regionY + adderY,
               pixelX,
@@ -9264,12 +9498,11 @@ localStorage.removeItem("lp");
                 state.availableColors,
                 !state.paintUnavailablePixels  // Use same parameter as target pixel
               );
-              const isMatch = mappedCanvasColor.id === targetPixelInfo.mappedColorId;
-              if (isMatch) {
+              if (mappedCanvasColor && mappedCanvasColor.id === targetPixelInfo.mappedColorId) {
                 alreadyPaintedCount++;
                 // Mark as painted in map but DO NOT increment progress counter
                 // Progress should only reflect actual painting sequence position
-                Utils.markPixelPainted(x, y, regionX + adderX, regionY + adderY);
+                Utils.markPixelPainted(pixelX, pixelY, regionX + adderX, regionY + adderY, localCoords);
                 continue; // Skip already painted pixels
               }
             }
@@ -9310,8 +9543,22 @@ localStorage.removeItem("lp");
           let absY = startY + y;
           let adderX = Math.floor(absX / 1000);
           let adderY = Math.floor(absY / 1000);
+          let pixelX = absX % 1000;
+          let pixelY = absY % 1000;
+          const localCoords = { localX: x, localY: y };
 
-          if (!Utils.isPixelPainted(x, y, regionX + adderX, regionY + adderY)) {
+          const tileRegionX = regionX + adderX;
+          const tileRegionY = regionY + adderY;
+          const stillPainted = await ensurePixelStateMatchesCanvas(
+            tileRegionX,
+            tileRegionY,
+            pixelX,
+            pixelY,
+            targetPixelInfo.mappedColorId,
+            localCoords
+          );
+
+          if (!stillPainted) {
             eligibleCoords.push([x, y, targetPixelInfo]);
           }
         }
@@ -9433,21 +9680,31 @@ localStorage.removeItem("lp");
         let adderY = Math.floor(absY / 1000);
         let pixelX = absX % 1000;
         let pixelY = absY % 1000;
+        const tileRegionX = regionX + adderX;
+        const tileRegionY = regionY + adderY;
+        const localCoords = { localX: x, localY: y };
 
         // CRITICAL FIX: Always check if pixel is already painted (both locally and on canvas)
-        if (Utils.isPixelPainted(x, y, regionX + adderX, regionY + adderY)) {
-          console.log(`⏭️ Skipping already painted pixel at (${x}, ${y}) - marked in local map`);
+        if (await ensurePixelStateMatchesCanvas(
+          tileRegionX,
+          tileRegionY,
+          pixelX,
+          pixelY,
+          targetPixelInfo.mappedColorId,
+          localCoords
+        )) {
+          console.log(`⏭️ Skipping already painted pixel at (${x}, ${y}) - confirmed on canvas`);
           continue; // Skip already painted pixels
         }
 
         // REAL-TIME CANVAS CHECK: Verify against actual canvas state to prevent overpainting
         try {
-          const existingColorRGBA = await overlayManager.getTilePixelColor(
-            regionX + adderX,
-            regionY + adderY,
+          const existingColorRGBA = await getCanvasPixelColor(
+            tileRegionX,
+            tileRegionY,
             pixelX,
             pixelY
-          ).catch(() => null);
+          );
 
           if (existingColorRGBA && Array.isArray(existingColorRGBA)) {
             const [er, eg, eb] = existingColorRGBA;
@@ -9456,13 +9713,11 @@ localStorage.removeItem("lp");
               state.availableColors,
               !state.paintUnavailablePixels
             );
-            const isAlreadyCorrect = existingMappedColor.id === targetPixelInfo.mappedColorId;
-
-            if (isAlreadyCorrect) {
+            if (existingMappedColor && existingMappedColor.id === targetPixelInfo.mappedColorId) {
               console.log(`✅ Pixel at (${x}, ${y}) already has correct color (${existingMappedColor.id}) - marking as painted`);
               // Mark it as painted in local map but DO NOT increment progress counter
               // Progress should only reflect actual painting sequence position
-              Utils.markPixelPainted(x, y, regionX + adderX, regionY + adderY);
+              Utils.markPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
               continue; // Skip painting this pixel
             }
           }
@@ -9476,8 +9731,8 @@ localStorage.removeItem("lp");
         // Set up pixel batch for new region if needed
         if (
           !pixelBatch ||
-          pixelBatch.regionX !== regionX + adderX ||
-          pixelBatch.regionY !== regionY + adderY
+          pixelBatch.regionX !== tileRegionX ||
+          pixelBatch.regionY !== tileRegionY
         ) {
           if (pixelBatch && pixelBatch.pixels.length > 0) {
             console.log(`🌍 Sending region-change batch with ${pixelBatch.pixels.length} pixels`);
@@ -9491,8 +9746,8 @@ localStorage.removeItem("lp");
           }
 
           pixelBatch = {
-            regionX: regionX + adderX,
-            regionY: regionY + adderY,
+            regionX: tileRegionX,
+            regionY: tileRegionY,
             pixels: [],
           };
         }
