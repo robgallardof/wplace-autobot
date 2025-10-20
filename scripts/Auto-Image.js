@@ -10520,12 +10520,18 @@ localStorage.removeItem("lp");
       return 0;
     }
   }
-  async function swapAccountTrigger(token) {
+  async function swapAccountTrigger(token, options = {}) {
+    const { allowWhenIdle = false } = options;
+
     // STRICT GUARD: Only allow account switching during active painting sessions OR controlled refresh
-    if (!state.running && !state.isFetchingAllAccounts) {
+    if (!allowWhenIdle && !state.running && !state.isFetchingAllAccounts) {
       console.warn('🔒 Account switching blocked - only allowed during active painting or controlled refresh');
       console.warn('🔒 Current state.running:', state.running, 'state.isFetchingAllAccounts:', state.isFetchingAllAccounts);
       return false;
+    }
+
+    if (allowWhenIdle && !state.running && !state.isFetchingAllAccounts) {
+      console.log('🟢 Manual override: allowing account switch while bot is idle.');
     }
 
     localStorage.removeItem("lp");
@@ -10675,7 +10681,7 @@ localStorage.removeItem("lp");
           try {
             // Switch to this account temporarily to fetch its data
             console.log(`🔄 [FETCH] Switching to ${account.displayName} to fetch fresh data...`);
-            await switchToSpecificAccount(account.token, account.displayName);
+            await switchToSpecificAccount(account.token, account.displayName, { allowIdleOverride: false });
             // await Utils.sleep(500); // Small delay to ensure switch takes effect
 
             // Fetch fresh account details
@@ -10702,7 +10708,7 @@ localStorage.removeItem("lp");
         if (originalCurrentAccount) {
           console.log(`🔙 [FETCH] Switching back to original current account: ${originalCurrentAccount.displayName}`);
           try {
-            await switchToSpecificAccount(originalCurrentAccount.token, originalCurrentAccount.displayName);
+            await switchToSpecificAccount(originalCurrentAccount.token, originalCurrentAccount.displayName, { allowIdleOverride: false });
             //await Utils.sleep(300);
 
             // Mark it as current again and sync index
@@ -10920,7 +10926,8 @@ localStorage.removeItem("lp");
   }
 
   // SIMPLIFIED ACCOUNT SWITCHING
-  async function switchToNextAccount(accounts) {
+  async function switchToNextAccount(accounts, options = {}) {
+    const { allowIdleOverride = true } = options;
     console.log(`🔄 [SWITCH] Starting account switch`);
 
     // Debounce rapid consecutive switches when no painting happened
@@ -10963,8 +10970,13 @@ localStorage.removeItem("lp");
     console.log(`� [SWITCH] Using token: ${nextAccount.token.substring(0, 20)}...`);
 
     // Perform the account switch
+    const allowWhenIdle = allowIdleOverride && !state.running && !state.isFetchingAllAccounts;
+    if (allowWhenIdle) {
+      console.log('🟢 [SWITCH] Allowing manual/idle account switch override.');
+    }
+
     try {
-      await swapAccountTrigger(nextAccount.token);
+      await swapAccountTrigger(nextAccount.token, { allowWhenIdle });
 
       // Update account index for backward compatibility
       state.accountIndex = accountManager.currentIndex;
@@ -11027,8 +11039,14 @@ localStorage.removeItem("lp");
   }
 
   // SIMPLIFIED helper function for specific account switching
-  async function switchToSpecificAccount(token, accountName) {
+  async function switchToSpecificAccount(token, accountName, options = {}) {
+    const { allowIdleOverride = true } = options;
     console.log(`🔄 [SPECIFIC SWITCH] Attempting to switch to account: ${accountName}`);
+
+    const allowWhenIdle = allowIdleOverride && !state.running && !state.isFetchingAllAccounts;
+    if (allowWhenIdle) {
+      console.log('🟢 [SPECIFIC SWITCH] Allowing manual/idle account switch override.');
+    }
 
     // Debounce rapid consecutive switches when no painting happened
     try {
@@ -11055,7 +11073,7 @@ localStorage.removeItem("lp");
       previousId = prev?.id || null;
     } catch {}
 
-    const ok = await swapAccountTrigger(token);
+    const ok = await swapAccountTrigger(token, { allowWhenIdle });
     if (!ok) {
       console.error('❌ [SPECIFIC SWITCH] Cookie confirmation failed');
       return false;
@@ -11190,7 +11208,7 @@ localStorage.removeItem("lp");
 
       if (candidate && ChargeModel.get(candidate.token)?.charges >= threshold) {
         console.log(`✅ [SEARCH] Local model found eligible account: ${candidate.name}`);
-        const ok = await switchToSpecificAccount(candidate.token, candidate.name);
+        const ok = await switchToSpecificAccount(candidate.token, candidate.name, { allowIdleOverride: false });
         return !!ok;
       }
 
