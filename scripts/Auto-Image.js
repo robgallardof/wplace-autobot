@@ -1978,6 +1978,7 @@ localStorage.removeItem("lp");
     calculateEstimatedTime: (remainingPixels, charges, cooldown) => window.globalUtilsManager ? window.globalUtilsManager.calculateEstimatedTime(remainingPixels, charges, cooldown) : 0,
     initializePaintedMap: (width, height) => window.globalUtilsManager ? window.globalUtilsManager.initializePaintedMap(width, height) : console.log('Painted map not available'),
     markPixelPainted: (...args) => window.globalUtilsManager ? window.globalUtilsManager.markPixelPainted(...args) : false,
+    unmarkPixelPainted: (...args) => window.globalUtilsManager ? window.globalUtilsManager.unmarkPixelPainted(...args) : false,
     isPixelPainted: (...args) => window.globalUtilsManager ? window.globalUtilsManager.isPixelPainted(...args) : false,
     shouldAutoSave: () => window.globalUtilsManager ? window.globalUtilsManager.shouldAutoSave() : false,
     performSmartSave: () => window.globalUtilsManager ? window.globalUtilsManager.performSmartSave() : false,
@@ -8951,10 +8952,13 @@ localStorage.removeItem("lp");
       }
 
       if (startIndex >= 0) {
-        // Resume from the found position (skip all previous coordinates)
+        // Resume from the found position while keeping earlier coordinates after wrap-around
         const filteredCoords = coords.slice(startIndex);
-        console.log(`✂️ Resuming: skipped ${startIndex} coordinates, continuing with ${filteredCoords.length} remaining`);
-        return filteredCoords;
+        const wrappedCoords = filteredCoords.concat(coords.slice(0, startIndex));
+        console.log(
+          `🔁 Resuming: starting at index ${startIndex} and wrapping remaining ${coords.length - startIndex} coordinates`
+        );
+        return wrappedCoords;
       } else {
         console.warn(`⚠️ Resume position (${startFromX}, ${startFromY}) not found in coordinate list, starting from beginning`);
       }
@@ -9310,7 +9314,6 @@ localStorage.removeItem("lp");
             continue;
           }
 
-          // Only include pixels that haven't been marked as painted yet
           let absX = startX + x;
           let absY = startY + y;
           let adderX = Math.floor(absX / 1000);
@@ -9319,13 +9322,42 @@ localStorage.removeItem("lp");
           let pixelY = absY % 1000;
           const localCoords = { localX: x, localY: y };
 
-          if (!Utils.isPixelPainted(pixelX, pixelY, regionX + adderX, regionY + adderY, localCoords)) {
-            eligibleCoords.push([x, y, targetPixelInfo]);
+          const tileRegionX = regionX + adderX;
+          const tileRegionY = regionY + adderY;
+          const isMarkedPainted = Utils.isPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
+
+          if (isMarkedPainted) {
+            const canvasStatus = await checkCanvasPixelStatus(
+              tileRegionX,
+              tileRegionY,
+              pixelX,
+              pixelY,
+              targetPixelInfo.mappedColorId
+            );
+
+            if (canvasStatus === 'match') {
+              skippedPixels.alreadyPainted++;
+              continue;
+            }
+
+            if (canvasStatus === 'mismatch') {
+              const wasMarked = Utils.unmarkPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
+              if (wasMarked) {
+                state.paintedPixels = Math.max(0, state.paintedPixels - 1);
+                await updateStats();
+              }
+              console.warn(`🧨 Detected griefed pixel at (${x}, ${y}) - re-adding to paint queue`);
+            } else {
+              console.warn(`⚠️ Unable to verify pixel at (${x}, ${y}); repainting for safety`);
+              Utils.unmarkPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
+            }
           }
+
+          eligibleCoords.push([x, y, targetPixelInfo]);
         }
       }
 
-      // Group pixels by color if color-by-color mode is enabled
+    // Group pixels by color if color-by-color mode is enabled
       let pixelsToProcess = eligibleCoords;
       if (state.paintingOrder === 'color-by-color') {
         console.log('🎨 Color-by-color mode enabled - grouping pixels by color');
@@ -9444,45 +9476,43 @@ localStorage.removeItem("lp");
         const tileRegionX = regionX + adderX;
         const tileRegionY = regionY + adderY;
         const localCoords = { localX: x, localY: y };
-
-        // CRITICAL FIX: Always check if pixel is already painted (both locally and on canvas)
-        if (Utils.isPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords)) {
-          console.log(`⏭️ Skipping already painted pixel at (${x}, ${y}) - marked in local map`);
-          continue; // Skip already painted pixels
-        }
-
-        // REAL-TIME CANVAS CHECK: Verify against actual canvas state to prevent overpainting
-        try {
-          const existingColorRGBA = await overlayManager.getTilePixelColor(
-            tileRegionX,
-            tileRegionY,
-            pixelX,
-            pixelY
-          ).catch(() => null);
-
-          if (existingColorRGBA && Array.isArray(existingColorRGBA)) {
-            const [er, eg, eb] = existingColorRGBA;
-            const existingMappedColor = Utils.resolveColor(
-              [er, eg, eb],
-              state.availableColors,
-              !state.paintUnavailablePixels
-            );
-            const isAlreadyCorrect = existingMappedColor.id === targetPixelInfo.mappedColorId;
-
-            if (isAlreadyCorrect) {
-              console.log(`✅ Pixel at (${x}, ${y}) already has correct color (${existingMappedColor.id}) - marking as painted`);
-              // Mark it as painted in local map but DO NOT increment progress counter
-              // Progress should only reflect actual painting sequence position
-              Utils.markPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
-              continue; // Skip painting this pixel
-            }
-          }
-        } catch (e) {
-          // If we can't check the canvas, proceed with painting (better to attempt than skip)
-          console.warn(`⚠️ Could not verify canvas state for pixel (${x}, ${y}), proceeding with paint:`, e.message);
-        }
-
         const targetMappedColorId = targetPixelInfo.mappedColorId;
+
+        const isMarkedPainted = Utils.isPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
+        const canvasStatus = await checkCanvasPixelStatus(
+          tileRegionX,
+          tileRegionY,
+          pixelX,
+          pixelY,
+          targetMappedColorId
+        );
+
+        if (isMarkedPainted) {
+          if (canvasStatus === 'match') {
+            console.log(`⏭️ Skipping already painted pixel at (${x}, ${y}) - confirmed on canvas`);
+            skippedPixels.alreadyPainted++;
+            continue;
+          }
+
+          if (canvasStatus === 'mismatch') {
+            const wasMarked = Utils.unmarkPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
+            if (wasMarked) {
+              state.paintedPixels = Math.max(0, state.paintedPixels - 1);
+              await updateStats();
+            }
+            console.warn(`🧨 Pixel at (${x}, ${y}) was altered after painting - repainting`);
+          } else {
+            console.warn(`⚠️ Unable to validate pixel at (${x}, ${y}) - repainting for safety`);
+            Utils.unmarkPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
+          }
+        } else if (canvasStatus === 'match') {
+          console.log(`✅ Pixel at (${x}, ${y}) already matches target color - marking as painted`);
+          Utils.markPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
+          skippedPixels.alreadyPainted++;
+          continue;
+        } else if (canvasStatus === 'unknown') {
+          console.warn(`⚠️ Could not confirm canvas state for pixel (${x}, ${y}) - proceeding with repaint`);
+        }
 
         // Set up pixel batch for new region if needed
         if (
@@ -9702,6 +9732,33 @@ localStorage.removeItem("lp");
       };
     }
     return { eligible: true, r, g, b, a, mappedColorId: mappedTargetColorId.id };
+  }
+
+  async function checkCanvasPixelStatus(tileRegionX, tileRegionY, pixelX, pixelY, expectedColorId) {
+    try {
+      const existingColorRGBA = await overlayManager
+        .getTilePixelColor(tileRegionX, tileRegionY, pixelX, pixelY)
+        .catch(() => null);
+
+      if (!existingColorRGBA || !Array.isArray(existingColorRGBA)) {
+        return 'unknown';
+      }
+
+      const [er, eg, eb] = existingColorRGBA;
+      const resolvedColor = Utils.resolveColor(
+        [er, eg, eb],
+        state.availableColors,
+        !state.paintUnavailablePixels
+      );
+
+      return resolvedColor.id === expectedColorId ? 'match' : 'mismatch';
+    } catch (error) {
+      console.warn(
+        `⚠️ Could not validate canvas pixel ${tileRegionX},${tileRegionY} (${pixelX},${pixelY}):`,
+        error?.message || error
+      );
+      return 'unknown';
+    }
   }
 
   // Helper function to skip pixel and log the reason (minimized logging)
@@ -11431,7 +11488,8 @@ async function generateCoordinatesAsync(
         }
       }
       if (startIndex >= 0) {
-        coords = coords.slice(startIndex);
+        const leading = coords.slice(0, startIndex);
+        coords = coords.slice(startIndex).concat(leading);
       }
     }
 
