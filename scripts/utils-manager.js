@@ -519,6 +519,37 @@ class WPlaceUtilsManager {
     row[localX] = true;
   }
 
+  unmarkPixelPainted(x, y, regionX = 0, regionY = 0, localCoords = null) {
+    const map = window.state?.paintedMap;
+    if (!Array.isArray(map)) return false;
+
+    let localX;
+    let localY;
+
+    if (
+      localCoords &&
+      Number.isFinite(localCoords.localX) &&
+      Number.isFinite(localCoords.localY)
+    ) {
+      ({ localX, localY } = localCoords);
+    } else {
+      ({ localX, localY } = this._calculateLocalPixelCoords(x, y, regionX, regionY));
+    }
+
+    localX = Math.trunc(localX);
+    localY = Math.trunc(localY);
+
+    if (localX < 0 || localY < 0) return false;
+    if (localY >= map.length) return false;
+
+    const row = map[localY];
+    if (!Array.isArray(row) || localX >= row.length) return false;
+
+    const wasMarked = Boolean(row[localX]);
+    row[localX] = false;
+    return wasMarked;
+  }
+
   isPixelPainted(x, y, regionX = 0, regionY = 0, localCoords = null) {
     const map = window.state?.paintedMap;
     if (!Array.isArray(map)) return false;
