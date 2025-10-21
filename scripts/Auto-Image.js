@@ -1020,6 +1020,7 @@ localStorage.removeItem("lp");
     processing: false,
     totalPixels: 0,
     paintedPixels: 0,
+    validationFailures: 0,
     preFilteringDone: false, // Track if pre-filtering detection has been done this session
     progressResetDone: false, // Track if progress reset has been done this save file session
     availableColors: [],
@@ -1155,6 +1156,9 @@ localStorage.removeItem("lp");
   let retryCount = 0;
   const MAX_RETRIES = 10;
   const MAX_BATCH_RETRIES = 10; // Maximum attempts for batch sending
+  const MAX_VALIDATION_RETRY_ATTEMPTS = 3; // Maximum times to requeue a pixel after failed validation
+  const POST_PAINT_VALIDATION_DELAY_MS = 200; // Allow canvas to update before validating freshly painted pixels
+  const MAX_VALIDATION_CHECKS = 3; // Maximum immediate validation checks per pixel before requeueing
 
   function inject(callback) {
     const script = document.createElement('script');
@@ -8963,76 +8967,160 @@ localStorage.removeItem("lp");
     return coords;
   }
 
-  async function flushPixelBatch(pixelBatch) {
-    if (!pixelBatch || pixelBatch.pixels.length === 0) return true;
+  async function validatePaintedPixels(pixels, regionX, regionY) {
+    const results = { valid: [], invalid: [] };
 
-    const batchSize = pixelBatch.pixels.length;
-    console.log(
-      `📦 Sending batch with ${batchSize} pixels (region: ${pixelBatch.regionX},${pixelBatch.regionY})`
-    );
+    if (!pixels || pixels.length === 0) {
+      return results;
+    }
+
+    if (!overlayManager || typeof overlayManager.getTilePixelColor !== 'function') {
+      return { valid: pixels.slice(), invalid: [] };
+    }
+
+    const palette = (state.availableColors && state.availableColors.length > 0)
+      ? state.availableColors
+      : Object.values(CONFIG.COLOR_MAP)
+          .filter((color) => color.rgb)
+          .map((color) => ({
+            id: color.id,
+            rgb: { ...color.rgb },
+          }));
+
+    if (POST_PAINT_VALIDATION_DELAY_MS > 0) {
+      await Utils.sleep(POST_PAINT_VALIDATION_DELAY_MS);
+    }
+
+    for (const pixel of pixels) {
+      let matched = false;
+
+      for (let attempt = 0; attempt < MAX_VALIDATION_CHECKS && !matched; attempt++) {
+        try {
+          const rgba = await overlayManager.getTilePixelColor(regionX, regionY, pixel.x, pixel.y);
+
+          if (rgba && Array.isArray(rgba)) {
+            const [r, g, b] = rgba;
+            const mappedColor = Utils.resolveColor(
+              [r, g, b],
+              palette,
+              !state.paintUnavailablePixels
+            );
+
+            if (mappedColor && mappedColor.id === pixel.expectedColorId) {
+              matched = true;
+              break;
+            }
+          }
+        } catch (error) {
+          console.warn(`⚠️ Validation check failed for pixel (${pixel.localX}, ${pixel.localY}) on attempt ${attempt + 1}:`, error?.message || error);
+        }
+
+        if (!matched && attempt < MAX_VALIDATION_CHECKS - 1) {
+          const retryDelay = Math.min(POST_PAINT_VALIDATION_DELAY_MS * (attempt + 1), 500);
+          if (retryDelay > 0) {
+            await Utils.sleep(retryDelay);
+          }
+        }
+      }
+
+      if (matched) {
+        results.valid.push(pixel);
+      } else {
+        results.invalid.push(pixel);
+      }
+    }
+
+    return results;
+  }
+
+  async function flushPixelBatch(pixelBatch) {
+    if (!pixelBatch || pixelBatch.pixels.length === 0) {
+      return { success: true, validatedPixels: [], failedPixels: [] };
+    }
+
+    const batchPixels = pixelBatch.pixels.map((p) => ({ ...p }));
+    const batchSize = batchPixels.length;
+
     const success = await sendBatchWithRetry(
-      pixelBatch.pixels,
+      batchPixels,
       pixelBatch.regionX,
       pixelBatch.regionY
     );
-    if (success) {
-      // Only increment progress for actually painted pixels to prevent multiplication
-      const actuallyPaintedCount = pixelBatch.pixels.length;
-      state.paintedPixels += actuallyPaintedCount;
-      console.log(`📊 Added ${actuallyPaintedCount} painted pixels to progress (total: ${state.paintedPixels})`);
 
-      pixelBatch.pixels.forEach((p) => {
+    if (!success) {
+      console.error('❌ Batch failed permanently after retries. Stopping painting.');
+      state.stopFlag = true;
+      updateUI('paintingBatchFailed', 'error');
+      pixelBatch.pixels = [];
+      return { success: false, validatedPixels: [], failedPixels: [] };
+    }
+
+    let validationResult;
+    try {
+      validationResult = await validatePaintedPixels(batchPixels, pixelBatch.regionX, pixelBatch.regionY);
+    } catch (error) {
+      console.warn('⚠️ Error during post-paint validation, assuming all pixels succeeded:', error);
+      validationResult = { valid: batchPixels, invalid: [] };
+    }
+
+    const { valid: validatedPixels, invalid: failedPixels } = validationResult;
+    const validatedCount = validatedPixels.length;
+
+    if (validatedCount > 0) {
+      state.paintedPixels += validatedCount;
+      console.log(`📊 Added ${validatedCount} validated pixels to progress (total: ${state.paintedPixels})`);
+
+      validatedPixels.forEach((p) => {
         Utils.markPixelPainted(p.x, p.y, pixelBatch.regionX, pixelBatch.regionY, {
           localX: p.localX,
           localY: p.localY,
         });
       });
 
-      // Update last painted position to the last pixel in the successful batch
-      if (pixelBatch.pixels.length > 0) {
-        const lastPixel = pixelBatch.pixels[pixelBatch.pixels.length - 1];
-        // FIXED: Use localX/localY (image-relative coordinates) instead of x/y (absolute canvas coordinates)
+      const lastPixel = validatedPixels[validatedPixels.length - 1];
+      if (lastPixel) {
         state.lastPaintedPosition = { x: lastPixel.localX, y: lastPixel.localY };
       }
-
-      // Track painted pixels since last account switch to avoid flip-flop
-      state.paintedSinceSwitch = (state.paintedSinceSwitch || 0) + actuallyPaintedCount;
-
-      // IMPORTANT: Decrement charges locally to match Acc-Switch.js behavior
-      state.displayCharges = Math.max(0, state.displayCharges - batchSize);
-      state.preciseCurrentCharges = Math.max(0, state.preciseCurrentCharges - batchSize);
-      // Also update the global local charge model per account with bonus logic
-      try {
-        const tok = accountManager.getCurrentAccount()?.token;
-        const after = ChargeModel.decrement(tok, batchSize);
-        state.displayCharges = Math.floor(after);
-        state.preciseCurrentCharges = after;
-        if (tok) accountManager.updateAccountData(tok, { Charges: state.displayCharges });
-      } catch {}
-
-      state.fullChargeData = {
-        ...state.fullChargeData,
-        spentSinceShot: state.fullChargeData.spentSinceShot + batchSize,
-      };
-      await updateStats();
-      // Update account list with new charges
-      await updateCurrentAccountInList();
-      // Progress tracking removed from UI to reduce visual clutter
-      Utils.performSmartSave();
-
-      if (CONFIG.PAINTING_SPEED_ENABLED && state.paintingSpeed > 0 && batchSize > 0) {
-        const delayPerPixel = 1000 / state.paintingSpeed;
-        const totalDelay = Math.max(100, delayPerPixel * batchSize);
-        await Utils.sleep(totalDelay);
-      }
     } else {
-      console.error(`❌ Batch failed permanently after retries. Stopping painting.`);
-      state.stopFlag = true;
-      updateUI('paintingBatchFailed', 'error');
+      console.warn('⚠️ Batch succeeded but no pixels validated on canvas - they will be re-queued.');
+    }
+
+    state.paintedSinceSwitch = (state.paintedSinceSwitch || 0) + validatedCount;
+
+    state.displayCharges = Math.max(0, state.displayCharges - batchSize);
+    state.preciseCurrentCharges = Math.max(0, state.preciseCurrentCharges - batchSize);
+    try {
+      const tok = accountManager.getCurrentAccount()?.token;
+      const after = ChargeModel.decrement(tok, batchSize);
+      state.displayCharges = Math.floor(after);
+      state.preciseCurrentCharges = after;
+      if (tok) accountManager.updateAccountData(tok, { Charges: state.displayCharges });
+    } catch {}
+
+    state.fullChargeData = {
+      ...state.fullChargeData,
+      spentSinceShot: state.fullChargeData.spentSinceShot + batchSize,
+    };
+
+    await updateCurrentAccountInList();
+
+    if (validatedCount > 0) {
+      Utils.performSmartSave();
+    }
+
+    if (CONFIG.PAINTING_SPEED_ENABLED && state.paintingSpeed > 0 && batchSize > 0) {
+      const delayPerPixel = 1000 / state.paintingSpeed;
+      const totalDelay = Math.max(100, delayPerPixel * batchSize);
+      await Utils.sleep(totalDelay);
+    }
+
+    if (failedPixels.length > 0) {
+      state.validationFailures = (state.validationFailures || 0) + failedPixels.length;
+      console.warn(`⚠️ Validation detected ${failedPixels.length} pixel(s) needing repaint.`);
     }
 
     pixelBatch.pixels = [];
-    return success;
+    return { success: true, validatedPixels, failedPixels };
   }
 
   async function processImage() {
@@ -9170,7 +9258,9 @@ localStorage.removeItem("lp");
       white: 0,
       alreadyPainted: 0,
       colorUnavailable: 0,
+      validationFailed: 0,
     };
+    state.validationFailures = 0;
 
     // IMPORTANT: Check charges once at start, then paint until depleted
     // Use local charge model to avoid extra API calls
@@ -9240,7 +9330,7 @@ localStorage.removeItem("lp");
 
           if (!targetPixelInfo.eligible) {
             if (targetPixelInfo.reason !== 'alreadyPainted') {
-              skippedPixels[targetPixelInfo.reason]++;
+              skippedPixels[targetPixelInfo.reason] = (skippedPixels[targetPixelInfo.reason] || 0) + 1;
 
             }
             continue;
@@ -9283,7 +9373,7 @@ localStorage.removeItem("lp");
           }
 
           // Add eligible unpainted pixel to list
-          eligibleCoords.push([x, y, targetPixelInfo]);
+          eligibleCoords.push({ x, y, targetPixelInfo });
         }
 
         // Mark pre-filtering as done for this session
@@ -9305,7 +9395,7 @@ localStorage.removeItem("lp");
 
           if (!targetPixelInfo.eligible) {
             if (targetPixelInfo.reason !== 'alreadyPainted') {
-              skippedPixels[targetPixelInfo.reason]++;
+              skippedPixels[targetPixelInfo.reason] = (skippedPixels[targetPixelInfo.reason] || 0) + 1;
             }
             continue;
           }
@@ -9320,7 +9410,7 @@ localStorage.removeItem("lp");
           const localCoords = { localX: x, localY: y };
 
           if (!Utils.isPixelPainted(pixelX, pixelY, regionX + adderX, regionY + adderY, localCoords)) {
-            eligibleCoords.push([x, y, targetPixelInfo]);
+            eligibleCoords.push({ x, y, targetPixelInfo });
           }
         }
       }
@@ -9329,15 +9419,16 @@ localStorage.removeItem("lp");
       let pixelsToProcess = eligibleCoords;
       if (state.paintingOrder === 'color-by-color') {
         console.log('🎨 Color-by-color mode enabled - grouping pixels by color');
-        
+
         // Group pixels by color ID
         const colorGroups = new Map();
-        for (const [x, y, targetPixelInfo] of eligibleCoords) {
+        for (const task of eligibleCoords) {
+          const { targetPixelInfo } = task;
           const colorId = targetPixelInfo.mappedColorId;
           if (!colorGroups.has(colorId)) {
             colorGroups.set(colorId, []);
           }
-          colorGroups.get(colorId).push([x, y, targetPixelInfo]);
+          colorGroups.get(colorId).push(task);
         }
 
         // Log color groups
@@ -9373,85 +9464,149 @@ localStorage.removeItem("lp");
       }
 
       // Paint eligible pixels (already pre-filtered, no duplicate checks)
-      outerLoop: for (const [x, y, targetPixelInfo] of pixelsToProcess) {
-        // Track current color being painted in color-by-color mode
-        if (state.paintingOrder === 'color-by-color') {
-          if (state.currentPaintingColor !== targetPixelInfo.mappedColorId) {
-            state.currentPaintingColor = targetPixelInfo.mappedColorId;
-            const colorInfo = Object.values(CONFIG.COLOR_MAP).find(c => c.id === state.currentPaintingColor);
-            const colorName = colorInfo ? colorInfo.name : `Color ${state.currentPaintingColor}`;
-            console.log(`🎨 Now painting: ${colorName} (ID: ${state.currentPaintingColor})`);
-            
-            // Update UI to show current color
-            const statusDiv = document.getElementById('statusDiv');
-            if (statusDiv) {
-              const colorMessage = Utils.t('currentlyPaintingColor', { colorName });
-              const colorIndicator = document.getElementById('currentColorIndicator');
-              if (colorIndicator) {
-                colorIndicator.textContent = colorMessage;
-              } else {
-                const indicator = document.createElement('div');
-                indicator.id = 'currentColorIndicator';
-                indicator.textContent = colorMessage;
-                indicator.style.cssText = 'margin-top: 8px; padding: 8px; background: rgba(255,255,255,0.1); border-radius: 6px; font-weight: bold;';
-                statusDiv.appendChild(indicator);
-              }
+      const retryQueue = [];
+      const pixelRetryCounts = new Map();
+      let validationRetryCount = 0;
+      let taskIndex = 0;
+
+      const takeNextPixelTask = () => {
+        if (retryQueue.length > 0) {
+          return retryQueue.shift();
+        }
+        if (taskIndex < pixelsToProcess.length) {
+          return pixelsToProcess[taskIndex++];
+        }
+        return null;
+      };
+
+      const queueValidationRetry = (pixel) => {
+        if (!pixel) return;
+        const key = `${pixel.localX},${pixel.localY}`;
+        const attempts = (pixelRetryCounts.get(key) || 0) + 1;
+        pixelRetryCounts.set(key, attempts);
+
+        if (attempts > MAX_VALIDATION_RETRY_ATTEMPTS) {
+          console.warn(`⚠️ Pixel (${pixel.localX}, ${pixel.localY}) exceeded max validation retries (${MAX_VALIDATION_RETRY_ATTEMPTS}) - skipping for this session.`);
+          skippedPixels.validationFailed++;
+          return;
+        }
+
+        validationRetryCount++;
+        retryQueue.push({
+          x: pixel.localX,
+          y: pixel.localY,
+          targetPixelInfo: null,
+        });
+      };
+
+      const flushBatchWithLogging = async (emoji, message) => {
+        if (!pixelBatch || pixelBatch.pixels.length === 0) {
+          return { success: true, failedPixels: [] };
+        }
+
+        console.log(`${emoji} ${message} with ${pixelBatch.pixels.length} pixels`);
+        const result = await flushPixelBatch(pixelBatch);
+
+        if (!result.success) {
+          console.error('❌ Batch failed permanently after retries. Stopping painting.');
+          state.stopFlag = true;
+          return result;
+        }
+
+        if (Array.isArray(result.failedPixels) && result.failedPixels.length > 0) {
+          result.failedPixels.forEach(queueValidationRetry);
+        }
+
+        await updateStats();
+        return result;
+      };
+
+      while (!state.stopFlag) {
+        const task = takeNextPixelTask();
+
+        if (!task) {
+          const finalResult = await flushBatchWithLogging('🏁', 'Sending final batch');
+          if (!finalResult.success) {
+            return 'stopped';
+          }
+          if (retryQueue.length === 0) {
+            break;
+          }
+          continue;
+        }
+
+        const { x, y } = task;
+        let targetPixelInfo = task.targetPixelInfo;
+
+        if (!targetPixelInfo || !targetPixelInfo.eligible) {
+          targetPixelInfo = checkPixelEligibility(x, y);
+          task.targetPixelInfo = targetPixelInfo;
+          if (!targetPixelInfo.eligible) {
+            if (targetPixelInfo.reason && targetPixelInfo.reason !== 'alreadyPainted') {
+              skippedPixels[targetPixelInfo.reason] = (skippedPixels[targetPixelInfo.reason] || 0) + 1;
+            }
+            continue;
+          }
+        }
+
+        if (state.paintingOrder === 'color-by-color' && state.currentPaintingColor !== targetPixelInfo.mappedColorId) {
+          state.currentPaintingColor = targetPixelInfo.mappedColorId;
+          const colorInfo = Object.values(CONFIG.COLOR_MAP).find(c => c.id === state.currentPaintingColor);
+          const colorName = colorInfo ? colorInfo.name : `Color ${state.currentPaintingColor}`;
+          console.log(`🎨 Now painting: ${colorName} (ID: ${state.currentPaintingColor})`);
+
+          const statusDiv = document.getElementById('statusDiv');
+          if (statusDiv) {
+            const colorMessage = Utils.t('currentlyPaintingColor', { colorName });
+            const colorIndicator = document.getElementById('currentColorIndicator');
+            if (colorIndicator) {
+              colorIndicator.textContent = colorMessage;
+            } else {
+              const indicator = document.createElement('div');
+              indicator.id = 'currentColorIndicator';
+              indicator.textContent = colorMessage;
+              indicator.style.cssText = 'margin-top: 8px; padding: 8px; background: rgba(255,255,255,0.1); border-radius: 6px; font-weight: bold;';
+              statusDiv.appendChild(indicator);
             }
           }
         }
 
         if (state.stopFlag) {
-          if (pixelBatch && pixelBatch.pixels.length > 0) {
-            console.log(`🎯 Sending last batch before stop with ${pixelBatch.pixels.length} pixels`);
-            await flushPixelBatch(pixelBatch);
-          }
+          const pausedResult = await flushBatchWithLogging('🎯', 'Sending last batch before stop');
           state.lastPosition = { x, y };
-          // Show paused coordinates in UI with proper translation template
-          // Use last painted position if available, otherwise use current position
           const pausedX = state.lastPaintedPosition.x || x;
           const pausedY = state.lastPaintedPosition.y || y;
           updateUI('paintingPaused', 'warning', { x: pausedX, y: pausedY });
           console.log(`⏸️ Painting paused after last painted coordinates (${pausedX}, ${pausedY})`);
-          return 'stopped';
+          return pausedResult.success ? 'stopped' : 'stopped';
         }
 
-        // Check if we have charges left (local count, no API call)
         if (state.displayCharges <= 0) {
-          // console.log("Try to buy paint charges");
-          // await purchase("paint_charges");
           await updateStats();
           if (state.displayCharges <= 0) {
             console.log('⚡ No charges left (local count), ending painting session');
-            if (pixelBatch && pixelBatch.pixels.length > 0) {
-              console.log(`🎯 Sending final batch with ${pixelBatch.pixels.length} pixels`);
-              await flushPixelBatch(pixelBatch);
-            }
+            const depletionResult = await flushBatchWithLogging('🎯', 'Sending final batch');
             state.lastPosition = { x, y };
-            return 'charges_depleted';
+            return depletionResult.success ? 'charges_depleted' : 'stopped';
           }
-          // else {
-          //   console.log(`🔋 Charges after purchase: ${state.displayCharges}, continuing painting`);
-          // }
         }
 
         let absX = startX + x;
         let absY = startY + y;
 
-        let adderX = Math.floor(absX / 1000);
-        let adderY = Math.floor(absY / 1000);
-        let pixelX = absX % 1000;
-        let pixelY = absY % 1000;
+        const adderX = Math.floor(absX / 1000);
+        const adderY = Math.floor(absY / 1000);
+        const pixelX = absX % 1000;
+        const pixelY = absY % 1000;
         const tileRegionX = regionX + adderX;
         const tileRegionY = regionY + adderY;
         const localCoords = { localX: x, localY: y };
 
-        // CRITICAL FIX: Always check if pixel is already painted (both locally and on canvas)
         if (Utils.isPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords)) {
           console.log(`⏭️ Skipping already painted pixel at (${x}, ${y}) - marked in local map`);
-          continue; // Skip already painted pixels
+          continue;
         }
 
-        // REAL-TIME CANVAS CHECK: Verify against actual canvas state to prevent overpainting
         try {
           const existingColorRGBA = await overlayManager.getTilePixelColor(
             tileRegionX,
@@ -9471,36 +9626,21 @@ localStorage.removeItem("lp");
 
             if (isAlreadyCorrect) {
               console.log(`✅ Pixel at (${x}, ${y}) already has correct color (${existingMappedColor.id}) - marking as painted`);
-              // Mark it as painted in local map but DO NOT increment progress counter
-              // Progress should only reflect actual painting sequence position
               Utils.markPixelPainted(pixelX, pixelY, tileRegionX, tileRegionY, localCoords);
-              continue; // Skip painting this pixel
+              continue;
             }
           }
         } catch (e) {
-          // If we can't check the canvas, proceed with painting (better to attempt than skip)
           console.warn(`⚠️ Could not verify canvas state for pixel (${x}, ${y}), proceeding with paint:`, e.message);
         }
 
         const targetMappedColorId = targetPixelInfo.mappedColorId;
 
-        // Set up pixel batch for new region if needed
-        if (
-          !pixelBatch ||
-          pixelBatch.regionX !== tileRegionX ||
-          pixelBatch.regionY !== tileRegionY
-        ) {
-          if (pixelBatch && pixelBatch.pixels.length > 0) {
-            console.log(`🌍 Sending region-change batch with ${pixelBatch.pixels.length} pixels`);
-            const success = await flushPixelBatch(pixelBatch);
-            if (!success) {
-              console.error(`❌ Batch failed permanently after retries. Stopping painting.`);
-              state.stopFlag = true;
-              return 'stopped';
-            }
-            await updateStats();
+        if (!pixelBatch || pixelBatch.regionX !== tileRegionX || pixelBatch.regionY !== tileRegionY) {
+          const regionResult = await flushBatchWithLogging('🌍', 'Sending region-change batch');
+          if (!regionResult.success) {
+            return 'stopped';
           }
-
           pixelBatch = {
             regionX: tileRegionX,
             regionY: tileRegionY,
@@ -9508,37 +9648,29 @@ localStorage.removeItem("lp");
           };
         }
 
-        // Add pixel to batch (no need to check again - already pre-filtered)
         pixelBatch.pixels.push({
           x: pixelX,
           y: pixelY,
           color: targetMappedColorId,
           localX: x,
           localY: y,
+          expectedColorId: targetMappedColorId,
+          targetPixelInfo,
+          tileRegionX,
+          tileRegionY,
         });
 
-        // Send batch if it's full
         const maxBatchSize = calculateBatchSize();
         if (pixelBatch.pixels.length >= maxBatchSize) {
-          console.log(`📦 Sending batch with ${pixelBatch.pixels.length} pixels`);
-          const success = await flushPixelBatch(pixelBatch);
-          if (!success) {
-            console.error(`❌ Batch failed permanently after retries. Stopping painting.`);
-            state.stopFlag = true;
+          const batchResult = await flushBatchWithLogging('📦', 'Sending batch');
+          if (!batchResult.success) {
             return 'stopped';
           }
-          pixelBatch.pixels = [];
-          await updateStats();
         }
       }
 
-      // Send final batch if any pixels remain
-      if (pixelBatch && pixelBatch.pixels.length > 0 && !state.stopFlag) {
-        console.log(`🏁 Sending final batch with ${pixelBatch.pixels.length} pixels`);
-        const success = await flushPixelBatch(pixelBatch);
-        if (!success) {
-          console.warn(`⚠️ Final batch failed with ${pixelBatch.pixels.length} pixels`);
-        }
+      if (validationRetryCount > 0) {
+        console.log(`🔁 Scheduled ${validationRetryCount} pixel(s) for validation retry during this session`);
       }
 
       // If we completed the entire coordinate loop, image is complete
@@ -9553,6 +9685,9 @@ localStorage.removeItem("lp");
       console.log(`   Pre-filtered - Transparent: ${skippedPixels.transparent}`);
       console.log(`   Pre-filtered - White: ${skippedPixels.white}`);
       console.log(`   Pre-filtered - Color Unavailable: ${skippedPixels.colorUnavailable}`);
+      console.log(`   Validation retries queued: ${validationRetryCount}`);
+      console.log(`   Validation failures (max retries reached): ${skippedPixels.validationFailed}`);
+      console.log(`   Total validation mismatches detected: ${state.validationFailures}`);
     }
   }
 

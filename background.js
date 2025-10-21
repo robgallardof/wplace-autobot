@@ -590,6 +590,119 @@ async function loadExtensionResources() {
 
 const cookieDomain = ".backend.wplace.live";
 
+function maskToken(token = "") {
+    if (typeof token !== "string") {
+        return "[invalid-token]";
+    }
+
+    const trimmed = token.trim();
+    if (trimmed.length <= 8) {
+        const start = trimmed.slice(0, 2);
+        const end = trimmed.slice(-2);
+        return `${start}…${end}`;
+    }
+
+    return `${trimmed.slice(0, 4)}…${trimmed.slice(-4)}`;
+}
+
+function mergeAccountRecords(existing = {}, incoming = {}) {
+    const merged = { ...existing };
+
+    Object.entries(incoming).forEach(([key, value]) => {
+        if (value === undefined || value === null) {
+            return;
+        }
+
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+
+            if (trimmed.length === 0 && typeof merged[key] === 'string' && merged[key].trim().length > 0) {
+                return;
+            }
+
+            merged[key] = trimmed;
+        } else {
+            merged[key] = value;
+        }
+    });
+
+    if (typeof merged.token === 'string') {
+        merged.token = merged.token.trim();
+        if (merged.token.length === 0) {
+            delete merged.token;
+        }
+    }
+
+    if (!merged.token && existing.token) {
+        merged.token = existing.token;
+    }
+
+    if (!merged.ID && existing.ID) {
+        merged.ID = existing.ID;
+    }
+
+    if (!merged.name && existing.name) {
+        merged.name = existing.name;
+    }
+
+    return merged;
+}
+
+function deduplicateAccounts(accounts = []) {
+    const result = [];
+    const tokenIndexMap = new Map();
+    const idIndexMap = new Map();
+
+    accounts.forEach((account) => {
+        if (!account) {
+            return;
+        }
+
+        const sanitized = mergeAccountRecords({}, account);
+        const token = sanitized.token;
+        const id = sanitized.ID;
+
+        let targetIndex = -1;
+        if (id && idIndexMap.has(id)) {
+            targetIndex = idIndexMap.get(id);
+        } else if (token && tokenIndexMap.has(token)) {
+            targetIndex = tokenIndexMap.get(token);
+        }
+
+        if (targetIndex > -1) {
+            const existing = result[targetIndex];
+            const previousToken = existing.token;
+            const merged = mergeAccountRecords(existing, sanitized);
+            result[targetIndex] = merged;
+
+            if (previousToken && previousToken !== merged.token) {
+                tokenIndexMap.delete(previousToken);
+            }
+
+            if (merged.token) {
+                tokenIndexMap.set(merged.token, targetIndex);
+            }
+
+            if (merged.ID) {
+                idIndexMap.set(merged.ID, targetIndex);
+            }
+        } else {
+            result.push(sanitized);
+            const newIndex = result.length - 1;
+
+            if (sanitized.token) {
+                tokenIndexMap.set(sanitized.token, newIndex);
+            }
+
+            if (sanitized.ID) {
+                idIndexMap.set(sanitized.ID, newIndex);
+            }
+        }
+    });
+
+    return result;
+}
+
 async function preserveAndResetJ() {
     let savedValue = null;
     let savedExpirationDate = null; // ✅ Store expiration date
@@ -606,37 +719,53 @@ async function preserveAndResetJ() {
             console.log("[bg] Saved j cookie:", savedValue);
             console.log("[bg] Cookie expires at:", savedExpirationDate ? new Date(savedExpirationDate * 1000).toISOString() : 'session');
 
-            const accountInfo = await checkTokenAndGetInfo(savedValue);
+            const accountCheck = await checkTokenAndGetInfo(savedValue);
 
-            if (accountInfo) {
+            if (accountCheck.status === 'ok') {
+                const accountInfo = accountCheck.data;
                 const store = await chrome.storage.local.get("infoAccounts");
                 let infoAccounts = store.infoAccounts || [];
 
-                const existingIndex = infoAccounts.findIndex(account => account.ID === accountInfo.ID);
+                let existingIndex = -1;
+                if (accountInfo.ID) {
+                    existingIndex = infoAccounts.findIndex(account => account.ID === accountInfo.ID);
+                }
+
+                if (existingIndex === -1 && accountInfo.token) {
+                    existingIndex = infoAccounts.findIndex(account => account.token === accountInfo.token);
+                }
+
+                const mergedAccount = mergeAccountRecords(
+                    existingIndex > -1 ? infoAccounts[existingIndex] : {},
+                    accountInfo
+                );
+
+                const accountWithMeta = {
+                    ...mergedAccount,
+                    expirationDate: savedExpirationDate,
+                    lastActive: new Date().toISOString()
+                };
 
                 if (existingIndex > -1) {
-                    // Merge existing data with new data to preserve any additional info
-                    const existingAccount = infoAccounts[existingIndex];
-                    infoAccounts[existingIndex] = {
-                        ...existingAccount, // Keep existing additional data
-                        ...accountInfo,     // Update with fresh data from API
-                        token: accountInfo.token, // Ensure token is updated
-                        name: accountInfo.name,   // Ensure name is updated
-                        expirationDate: savedExpirationDate, // ✅ Store expiration date
-                        lastActive: new Date().toISOString() // Update last seen
-                    };
-                    console.log(`✅ ID ${accountInfo.ID} found. Updated account info with expiration.`);
+                    infoAccounts[existingIndex] = accountWithMeta;
+                    console.log(`✅ Updated account ${accountWithMeta.name} (${accountWithMeta.ID}) with new data.`);
                 } else {
-                    accountInfo.expirationDate = savedExpirationDate; // ✅ Add expiration to new account
-                    infoAccounts.push(accountInfo);
-                    console.log(`✅ New account added: ${accountInfo.name} (${accountInfo.ID}) with expiration.`);
+                    infoAccounts.push(accountWithMeta);
+                    console.log(`✅ New account added: ${accountWithMeta.name} (${accountWithMeta.ID}) with expiration.`);
+                }
+
+                const beforeDedup = infoAccounts.length;
+                infoAccounts = deduplicateAccounts(infoAccounts);
+                if (infoAccounts.length !== beforeDedup) {
+                    console.log(`♻️ Removed ${beforeDedup - infoAccounts.length} duplicate account(s) during preservation.`);
                 }
 
                 await chrome.storage.local.set({ infoAccounts });
                 await exportInfoAccount();
-
+            } else if (accountCheck.status === 'invalid') {
+                console.warn(`❌ Current token is invalid (${accountCheck.message || 'unauthorized'}), not saving.`);
             } else {
-                console.warn("❌ Current token is invalid, not saving.");
+                console.warn(`⚠️ Could not verify current token (${accountCheck.statusCode || accountCheck.message || 'unknown error'}). Keeping existing data for now.`);
             }
         } else {
             console.warn("[bg] No 'j' cookie found. Skipping account verification.");
@@ -669,42 +798,94 @@ async function preserveAndResetJ() {
 async function filterInvalid() {
     const store = await chrome.storage.local.get("infoAccounts");
     let infoAccounts = store.infoAccounts || [];
-    let validAccounts = [];
+
+    const initialLength = infoAccounts.length;
+    infoAccounts = deduplicateAccounts(infoAccounts);
+    if (infoAccounts.length !== initialLength) {
+        console.log(`♻️ Removed ${initialLength - infoAccounts.length} duplicate account(s) before validation.`);
+    }
+
+    const updatedAccounts = [];
+    let invalidCount = 0;
+    let retainedOnErrorCount = 0;
 
     for (const account of infoAccounts) {
-        // This is a simplified check for validity
-        const isValid = await checkTokenAndGetInfo(account.token);
-        if (isValid) {
-            console.log("Token valid:", account.token);
-            validAccounts.push(account);
+        if (!account?.token) {
+            console.warn("[bg] Skipping account without token during validation:", account);
+            continue;
+        }
 
+        const checkResult = await checkTokenAndGetInfo(account.token);
+        const normalizedResult = checkResult || { status: 'error', message: 'Unknown validation failure' };
+
+        if (normalizedResult.status === 'ok') {
+            console.log(`Token valid: ${maskToken(account.token)}`);
+            const mergedAccount = mergeAccountRecords(account, normalizedResult.data);
+            mergedAccount.lastVerified = new Date().toISOString();
+            mergedAccount.validationStatus = 'valid';
+            if (mergedAccount.lastValidationError) {
+                delete mergedAccount.lastValidationError;
+            }
+            updatedAccounts.push(mergedAccount);
+        } else if (normalizedResult.status === 'invalid') {
+            invalidCount++;
+            console.log(`Token invalid: ${maskToken(account.token)} (${normalizedResult.message || 'unauthorized'})`);
         } else {
-            console.log("Token invalid:", account.token);
+            retainedOnErrorCount++;
+            const retryHint = normalizedResult.retryAfter ? `, retry-after: ${normalizedResult.retryAfter}` : '';
+            console.warn(`⚠️ Temporary issue validating ${maskToken(account.token)} (${normalizedResult.statusCode || 'no-status'}${retryHint}). Keeping cached data.`);
+            const retainedAccount = mergeAccountRecords({}, account);
+            retainedAccount.validationStatus = 'unknown';
+            retainedAccount.lastValidationError = {
+                status: normalizedResult.statusCode || null,
+                message: normalizedResult.message || (normalizedResult.error && normalizedResult.error.message) || 'Validation failed',
+                retryAfter: normalizedResult.retryAfter || null,
+                timestamp: new Date().toISOString(),
+            };
+            updatedAccounts.push(retainedAccount);
         }
     }
 
-    await chrome.storage.local.set({ infoAccounts: validAccounts });
-    console.log(`✅ Filtered and saved ${validAccounts.length} valid accounts.`);
+    const dedupedValidAccounts = deduplicateAccounts(updatedAccounts);
+    await chrome.storage.local.set({ infoAccounts: dedupedValidAccounts });
+    console.log(`✅ Validation complete. Saved ${dedupedValidAccounts.length} account(s). Removed ${invalidCount} invalid account(s) and retained ${retainedOnErrorCount} pending recheck.`);
     await exportInfoAccount();
 }
 
 async function exportInfoAccount() {
     const store = await chrome.storage.local.get("infoAccounts");
-    const infoAccounts = store.infoAccounts || [];
-    const accounts = infoAccounts.map(info => info.token);
-    await chrome.storage.local.set({ accounts });
+    const rawAccounts = store.infoAccounts || [];
+    const dedupedAccounts = deduplicateAccounts(rawAccounts);
+
+    if (dedupedAccounts.length !== rawAccounts.length) {
+        console.log(`♻️ exportInfoAccount removed ${rawAccounts.length - dedupedAccounts.length} duplicate info account(s).`);
+        await chrome.storage.local.set({ infoAccounts: dedupedAccounts });
+    }
+
+    const tokens = dedupedAccounts
+        .map(info => info.token)
+        .filter(token => typeof token === 'string' && token.length > 0);
+
+    const uniqueTokens = Array.from(new Set(tokens));
+    await chrome.storage.local.set({ accounts: uniqueTokens });
 }
 
 async function checkTokenAndGetInfo(token) {
     if (!token) {
-        return null;
+        return { status: 'invalid', message: 'Missing token' };
     }
-    console.log("Checking with token:", token);
+
+    const cleanedToken = typeof token === 'string' ? token.trim() : token;
+    if (!cleanedToken) {
+        return { status: 'invalid', message: 'Empty token' };
+    }
+
+    console.log(`[bg] Checking with token: ${maskToken(cleanedToken)}`);
     try {
-        await setCookie(token);
+        await setCookie(cleanedToken);
         const response = await fetch("https://backend.wplace.live/me", {
             method: "GET",
-            headers: { "Authorization": `Bearer ${token}` }
+            headers: { "Authorization": `Bearer ${cleanedToken}` }
         });
 
         if (response.ok) {
@@ -715,7 +896,7 @@ async function checkTokenAndGetInfo(token) {
             const userInfo = {
                 ID: userData.id,
                 name: userData.name,
-                token: token,
+                token: cleanedToken,
                 Charges: Math.floor(userData.charges.count),
                 Max: userData.charges.max,
                 Droplets: userData.droplets,
@@ -729,7 +910,7 @@ async function checkTokenAndGetInfo(token) {
             try {
                 const allianceResponse = await fetch(`https://backend.wplace.live/alliance/`, {
                     method: "GET",
-                    headers: { "Authorization": `Bearer ${token}` }
+                    headers: { "Authorization": `Bearer ${cleanedToken}` }
                 });
 
                 if (allianceResponse.ok) {
@@ -742,19 +923,22 @@ async function checkTokenAndGetInfo(token) {
             }
 
             console.log("Enhanced user info:", userInfo);
-            return userInfo;
+            return { status: 'ok', data: userInfo };
         }
 
-        if (response.status === 401) {
-            console.log("Token invalid: Unauthorized (401)");
-        } else {
-            console.error(`⚠️ Token check failed with status: ${response.status}`);
+        if (response.status === 401 || response.status === 403) {
+            console.log(`Token invalid: Unauthorized (${response.status})`);
+            return { status: 'invalid', statusCode: response.status, message: 'Unauthorized' };
         }
-        return null;
+
+        const statusMessage = response.statusText || 'Token validation failed';
+        console.warn(`⚠️ Token check failed with status: ${response.status} (${statusMessage})`);
+        const retryAfter = response.headers?.get?.('retry-after') || null;
+        return { status: 'error', statusCode: response.status, message: statusMessage, retryAfter };
 
     } catch (e) {
         console.error("❌ Network or fetch error:", e);
-        return null;
+        return { status: 'error', message: e.message || 'Network error', error: e };
     }
 }
 

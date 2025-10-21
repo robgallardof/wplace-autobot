@@ -184,11 +184,37 @@ async function loadAccounts() {
 
         const response = await chrome.runtime.sendMessage({ type: 'getAccounts' });
         const storedAccounts = response?.accounts || [];
-        const result = await chrome.storage.local.get('infoAccounts');
-        const infoAccounts = result.infoAccounts || [];
 
-        accounts = storedAccounts.map((token, index) => {
-            const info = infoAccounts.find(acc => acc.token === token);
+        const uniqueTokens = [];
+        const seenTokens = new Set();
+
+        storedAccounts.forEach(rawToken => {
+            if (typeof rawToken !== 'string') {
+                return;
+            }
+            const token = rawToken.trim();
+            if (!token || seenTokens.has(token)) {
+                return;
+            }
+            seenTokens.add(token);
+            uniqueTokens.push(token);
+        });
+
+        if (uniqueTokens.length !== storedAccounts.length) {
+            console.log(`♻️ Removed ${storedAccounts.length - uniqueTokens.length} duplicate token(s) from stored account list.`);
+            await chrome.storage.local.set({ accounts: uniqueTokens });
+        }
+
+        const result = await chrome.storage.local.get('infoAccounts');
+        const infoAccounts = deduplicateAccountList(result.infoAccounts || []);
+        const infoAccountMap = new Map(
+            infoAccounts
+                .filter(account => account?.token)
+                .map(account => [account.token, account])
+        );
+
+        accounts = uniqueTokens.map((token, index) => {
+            const info = infoAccountMap.get(token);
             console.log(`Account ${index + 1} info:`, info);
             return {
                 index,
@@ -241,17 +267,42 @@ function createAccountElement(account, index) {
     div.dataset.index = index;
 
     // Format like the old version: Name, Charges/Max, and Droplets
-    const charges = Math.floor(account.Charges);
-    const max = Math.floor(account.Max);
-    const droplets = Math.floor(account.Droplets);
+    const normalizeStat = (value, fallback = 0) => {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) {
+            return fallback;
+        }
+        return Math.max(0, Math.floor(numeric));
+    };
+
+    const charges = normalizeStat(account?.Charges ?? account?.currentPixels ?? account?.charges, 0);
+    let max = normalizeStat(account?.Max ?? account?.maxPixels ?? account?.MaxCharges, charges || 0);
+    if (max < charges) {
+        max = charges;
+    }
+    const droplets = normalizeStat(account?.Droplets ?? account?.droplets, 0);
+
+    const rawName = typeof account?.name === 'string' && account.name.trim().length > 0
+        ? account.name.trim()
+        : `Account ${index + 1}`;
+    const displayName = escapeHtml(rawName);
+
+    const isValidationPending = account?.validationStatus === 'unknown';
+    const statusBadge = isValidationPending
+        ? '<span class="account-status-badge">⚠️</span>'
+        : '';
+    const validationMessage = isValidationPending
+        ? '<div class="account-note">Using last known data — validation will retry shortly</div>'
+        : '';
 
     div.innerHTML = `
         <div class="account-info">
-            <div class="account-name">${escapeHtml(account.name)}</div>
+            <div class="account-name ${isValidationPending ? 'has-warning' : ''}">${statusBadge}<span>${displayName}</span></div>
             <div class="account-stats">
                 <span>⚡ ${charges}/${max}</span>
                 <span>💧 ${droplets}</span>
             </div>
+            ${validationMessage}
         </div>
         <div class="account-actions">
             <button class="btn btn-primary btn-icon switch-btn" title="Switch to this account" data-action="switch" data-index="${index}">
@@ -494,6 +545,7 @@ async function handleSaveAccount() {
             allianceRole: 'Member',
             totalPixelsPainted: 0,
             level: 1,
+            validationStatus: 'unknown',
         };
 
         if (existingIndex > -1) {
@@ -506,12 +558,18 @@ async function handleSaveAccount() {
             showNotification('Account added successfully', 'success');
         }
 
+        const beforeDedup = infoAccounts.length;
+        infoAccounts = deduplicateAccountList(infoAccounts);
+        if (infoAccounts.length !== beforeDedup) {
+            console.log(`♻️ Removed ${beforeDedup - infoAccounts.length} duplicate account(s) after manual save.`);
+        }
+
         // Save to storage
         await chrome.storage.local.set({ infoAccounts });
 
         // Update accounts list in background
-        const accounts = infoAccounts.map(info => info.token);
-        await chrome.storage.local.set({ accounts });
+        const accountTokens = getUniqueAccountTokens(infoAccounts);
+        await chrome.storage.local.set({ accounts: accountTokens });
 
         closeAddAccountModal();
         await loadAccounts();
@@ -829,11 +887,17 @@ async function handleImportAccounts() {
                     }
                 }
                 
-                // Save updated accounts
+                // Deduplicate and save updated accounts
+                const beforeDedup = existingAccounts.length;
+                existingAccounts = deduplicateAccountList(existingAccounts);
+                if (existingAccounts.length !== beforeDedup) {
+                    console.log(`♻️ Removed ${beforeDedup - existingAccounts.length} duplicate account(s) during import.`);
+                }
+
                 await chrome.storage.local.set({ infoAccounts: existingAccounts });
-                
+
                 // Update the accounts array for compatibility
-                const accountTokens = existingAccounts.map(account => account.token);
+                const accountTokens = getUniqueAccountTokens(existingAccounts);
                 await chrome.storage.local.set({ accounts: accountTokens });
                 
                 // Reload the accounts display
@@ -882,6 +946,120 @@ async function validateAccountToken(token) {
     } catch (error) {
         return { valid: false, error: error.message };
     }
+}
+
+function mergeAccountData(existing = {}, incoming = {}) {
+    const merged = { ...existing };
+
+    Object.entries(incoming || {}).forEach(([key, value]) => {
+        if (value === undefined || value === null) {
+            return;
+        }
+
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+
+            if (trimmed.length === 0 && typeof merged[key] === 'string' && merged[key].trim().length > 0) {
+                return;
+            }
+
+            merged[key] = trimmed;
+        } else {
+            merged[key] = value;
+        }
+    });
+
+    if (typeof merged.token === 'string') {
+        merged.token = merged.token.trim();
+        if (merged.token.length === 0) {
+            delete merged.token;
+        }
+    }
+
+    if (!merged.token && existing.token) {
+        merged.token = existing.token;
+    }
+
+    if (!merged.ID && existing.ID) {
+        merged.ID = existing.ID;
+    }
+
+    if (!merged.name && existing.name) {
+        merged.name = existing.name;
+    }
+
+    return merged;
+}
+
+function deduplicateAccountList(accounts = []) {
+    const result = [];
+    const tokenIndexMap = new Map();
+    const idIndexMap = new Map();
+
+    accounts.forEach((account) => {
+        if (!account) {
+            return;
+        }
+
+        const sanitized = mergeAccountData({}, account);
+        const token = sanitized.token;
+        const id = sanitized.ID;
+
+        let targetIndex = -1;
+        if (id && idIndexMap.has(id)) {
+            targetIndex = idIndexMap.get(id);
+        } else if (token && tokenIndexMap.has(token)) {
+            targetIndex = tokenIndexMap.get(token);
+        }
+
+        if (targetIndex > -1) {
+            const existing = result[targetIndex];
+            const previousToken = existing.token;
+            const merged = mergeAccountData(existing, sanitized);
+            result[targetIndex] = merged;
+
+            if (previousToken && previousToken !== merged.token) {
+                tokenIndexMap.delete(previousToken);
+            }
+
+            if (merged.token) {
+                tokenIndexMap.set(merged.token, targetIndex);
+            }
+
+            if (merged.ID) {
+                idIndexMap.set(merged.ID, targetIndex);
+            }
+        } else {
+            result.push(sanitized);
+            const newIndex = result.length - 1;
+
+            if (sanitized.token) {
+                tokenIndexMap.set(sanitized.token, newIndex);
+            }
+
+            if (sanitized.ID) {
+                idIndexMap.set(sanitized.ID, newIndex);
+            }
+        }
+    });
+
+    return result;
+}
+
+function getUniqueAccountTokens(accounts = []) {
+    return Array.from(
+        new Set(
+            accounts
+                .map(account => {
+                    if (!account?.token || typeof account.token !== 'string') {
+                        return null;
+                    }
+                    const token = account.token.trim();
+                    return token.length > 0 ? token : null;
+                })
+                .filter(Boolean)
+        )
+    );
 }
 
 // Keyboard shortcuts
