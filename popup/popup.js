@@ -267,17 +267,42 @@ function createAccountElement(account, index) {
     div.dataset.index = index;
 
     // Format like the old version: Name, Charges/Max, and Droplets
-    const charges = Math.floor(account.Charges);
-    const max = Math.floor(account.Max);
-    const droplets = Math.floor(account.Droplets);
+    const normalizeStat = (value, fallback = 0) => {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) {
+            return fallback;
+        }
+        return Math.max(0, Math.floor(numeric));
+    };
+
+    const charges = normalizeStat(account?.Charges ?? account?.currentPixels ?? account?.charges, 0);
+    let max = normalizeStat(account?.Max ?? account?.maxPixels ?? account?.MaxCharges, charges || 0);
+    if (max < charges) {
+        max = charges;
+    }
+    const droplets = normalizeStat(account?.Droplets ?? account?.droplets, 0);
+
+    const rawName = typeof account?.name === 'string' && account.name.trim().length > 0
+        ? account.name.trim()
+        : `Account ${index + 1}`;
+    const displayName = escapeHtml(rawName);
+
+    const isValidationPending = account?.validationStatus === 'unknown';
+    const statusBadge = isValidationPending
+        ? '<span class="account-status-badge">⚠️</span>'
+        : '';
+    const validationMessage = isValidationPending
+        ? '<div class="account-note">Using last known data — validation will retry shortly</div>'
+        : '';
 
     div.innerHTML = `
         <div class="account-info">
-            <div class="account-name">${escapeHtml(account.name)}</div>
+            <div class="account-name ${isValidationPending ? 'has-warning' : ''}">${statusBadge}<span>${displayName}</span></div>
             <div class="account-stats">
                 <span>⚡ ${charges}/${max}</span>
                 <span>💧 ${droplets}</span>
             </div>
+            ${validationMessage}
         </div>
         <div class="account-actions">
             <button class="btn btn-primary btn-icon switch-btn" title="Switch to this account" data-action="switch" data-index="${index}">
@@ -520,6 +545,7 @@ async function handleSaveAccount() {
             allianceRole: 'Member',
             totalPixelsPainted: 0,
             level: 1,
+            validationStatus: 'unknown',
         };
 
         if (existingIndex > -1) {
