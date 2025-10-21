@@ -590,6 +590,104 @@ async function loadExtensionResources() {
 
 const cookieDomain = ".backend.wplace.live";
 
+function mergeAccountRecords(existing = {}, incoming = {}) {
+    const merged = { ...existing };
+
+    Object.entries(incoming).forEach(([key, value]) => {
+        if (value === undefined || value === null) {
+            return;
+        }
+
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+
+            if (trimmed.length === 0 && typeof merged[key] === 'string' && merged[key].trim().length > 0) {
+                return;
+            }
+
+            merged[key] = trimmed;
+        } else {
+            merged[key] = value;
+        }
+    });
+
+    if (typeof merged.token === 'string') {
+        merged.token = merged.token.trim();
+        if (merged.token.length === 0) {
+            delete merged.token;
+        }
+    }
+
+    if (!merged.token && existing.token) {
+        merged.token = existing.token;
+    }
+
+    if (!merged.ID && existing.ID) {
+        merged.ID = existing.ID;
+    }
+
+    if (!merged.name && existing.name) {
+        merged.name = existing.name;
+    }
+
+    return merged;
+}
+
+function deduplicateAccounts(accounts = []) {
+    const result = [];
+    const tokenIndexMap = new Map();
+    const idIndexMap = new Map();
+
+    accounts.forEach((account) => {
+        if (!account) {
+            return;
+        }
+
+        const sanitized = mergeAccountRecords({}, account);
+        const token = sanitized.token;
+        const id = sanitized.ID;
+
+        let targetIndex = -1;
+        if (id && idIndexMap.has(id)) {
+            targetIndex = idIndexMap.get(id);
+        } else if (token && tokenIndexMap.has(token)) {
+            targetIndex = tokenIndexMap.get(token);
+        }
+
+        if (targetIndex > -1) {
+            const existing = result[targetIndex];
+            const previousToken = existing.token;
+            const merged = mergeAccountRecords(existing, sanitized);
+            result[targetIndex] = merged;
+
+            if (previousToken && previousToken !== merged.token) {
+                tokenIndexMap.delete(previousToken);
+            }
+
+            if (merged.token) {
+                tokenIndexMap.set(merged.token, targetIndex);
+            }
+
+            if (merged.ID) {
+                idIndexMap.set(merged.ID, targetIndex);
+            }
+        } else {
+            result.push(sanitized);
+            const newIndex = result.length - 1;
+
+            if (sanitized.token) {
+                tokenIndexMap.set(sanitized.token, newIndex);
+            }
+
+            if (sanitized.ID) {
+                idIndexMap.set(sanitized.ID, newIndex);
+            }
+        }
+    });
+
+    return result;
+}
+
 async function preserveAndResetJ() {
     let savedValue = null;
     let savedExpirationDate = null; // ✅ Store expiration date
@@ -612,24 +710,38 @@ async function preserveAndResetJ() {
                 const store = await chrome.storage.local.get("infoAccounts");
                 let infoAccounts = store.infoAccounts || [];
 
-                const existingIndex = infoAccounts.findIndex(account => account.ID === accountInfo.ID);
+                let existingIndex = -1;
+                if (accountInfo.ID) {
+                    existingIndex = infoAccounts.findIndex(account => account.ID === accountInfo.ID);
+                }
+
+                if (existingIndex === -1 && accountInfo.token) {
+                    existingIndex = infoAccounts.findIndex(account => account.token === accountInfo.token);
+                }
+
+                const mergedAccount = mergeAccountRecords(
+                    existingIndex > -1 ? infoAccounts[existingIndex] : {},
+                    accountInfo
+                );
+
+                const accountWithMeta = {
+                    ...mergedAccount,
+                    expirationDate: savedExpirationDate,
+                    lastActive: new Date().toISOString()
+                };
 
                 if (existingIndex > -1) {
-                    // Merge existing data with new data to preserve any additional info
-                    const existingAccount = infoAccounts[existingIndex];
-                    infoAccounts[existingIndex] = {
-                        ...existingAccount, // Keep existing additional data
-                        ...accountInfo,     // Update with fresh data from API
-                        token: accountInfo.token, // Ensure token is updated
-                        name: accountInfo.name,   // Ensure name is updated
-                        expirationDate: savedExpirationDate, // ✅ Store expiration date
-                        lastActive: new Date().toISOString() // Update last seen
-                    };
-                    console.log(`✅ ID ${accountInfo.ID} found. Updated account info with expiration.`);
+                    infoAccounts[existingIndex] = accountWithMeta;
+                    console.log(`✅ Updated account ${accountWithMeta.name} (${accountWithMeta.ID}) with new data.`);
                 } else {
-                    accountInfo.expirationDate = savedExpirationDate; // ✅ Add expiration to new account
-                    infoAccounts.push(accountInfo);
-                    console.log(`✅ New account added: ${accountInfo.name} (${accountInfo.ID}) with expiration.`);
+                    infoAccounts.push(accountWithMeta);
+                    console.log(`✅ New account added: ${accountWithMeta.name} (${accountWithMeta.ID}) with expiration.`);
+                }
+
+                const beforeDedup = infoAccounts.length;
+                infoAccounts = deduplicateAccounts(infoAccounts);
+                if (infoAccounts.length !== beforeDedup) {
+                    console.log(`♻️ Removed ${beforeDedup - infoAccounts.length} duplicate account(s) during preservation.`);
                 }
 
                 await chrome.storage.local.set({ infoAccounts });
@@ -669,30 +781,54 @@ async function preserveAndResetJ() {
 async function filterInvalid() {
     const store = await chrome.storage.local.get("infoAccounts");
     let infoAccounts = store.infoAccounts || [];
-    let validAccounts = [];
+
+    const initialLength = infoAccounts.length;
+    infoAccounts = deduplicateAccounts(infoAccounts);
+    if (infoAccounts.length !== initialLength) {
+        console.log(`♻️ Removed ${initialLength - infoAccounts.length} duplicate account(s) before validation.`);
+    }
+
+    const validAccounts = [];
 
     for (const account of infoAccounts) {
-        // This is a simplified check for validity
-        const isValid = await checkTokenAndGetInfo(account.token);
-        if (isValid) {
-            console.log("Token valid:", account.token);
-            validAccounts.push(account);
+        if (!account?.token) {
+            console.warn("[bg] Skipping account without token during validation:", account);
+            continue;
+        }
 
+        const verifiedInfo = await checkTokenAndGetInfo(account.token);
+        if (verifiedInfo) {
+            console.log("Token valid:", account.token);
+            const mergedAccount = mergeAccountRecords(account, verifiedInfo);
+            mergedAccount.lastVerified = new Date().toISOString();
+            validAccounts.push(mergedAccount);
         } else {
             console.log("Token invalid:", account.token);
         }
     }
 
-    await chrome.storage.local.set({ infoAccounts: validAccounts });
-    console.log(`✅ Filtered and saved ${validAccounts.length} valid accounts.`);
+    const dedupedValidAccounts = deduplicateAccounts(validAccounts);
+    await chrome.storage.local.set({ infoAccounts: dedupedValidAccounts });
+    console.log(`✅ Filtered and saved ${dedupedValidAccounts.length} valid accounts.`);
     await exportInfoAccount();
 }
 
 async function exportInfoAccount() {
     const store = await chrome.storage.local.get("infoAccounts");
-    const infoAccounts = store.infoAccounts || [];
-    const accounts = infoAccounts.map(info => info.token);
-    await chrome.storage.local.set({ accounts });
+    const rawAccounts = store.infoAccounts || [];
+    const dedupedAccounts = deduplicateAccounts(rawAccounts);
+
+    if (dedupedAccounts.length !== rawAccounts.length) {
+        console.log(`♻️ exportInfoAccount removed ${rawAccounts.length - dedupedAccounts.length} duplicate info account(s).`);
+        await chrome.storage.local.set({ infoAccounts: dedupedAccounts });
+    }
+
+    const tokens = dedupedAccounts
+        .map(info => info.token)
+        .filter(token => typeof token === 'string' && token.length > 0);
+
+    const uniqueTokens = Array.from(new Set(tokens));
+    await chrome.storage.local.set({ accounts: uniqueTokens });
 }
 
 async function checkTokenAndGetInfo(token) {
