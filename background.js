@@ -605,6 +605,7 @@ function maskToken(token = "") {
     return `${trimmed.slice(0, 4)}…${trimmed.slice(-4)}`;
 }
 
+
 function mergeAccountRecords(existing = {}, incoming = {}) {
     const merged = { ...existing };
 
@@ -809,12 +810,12 @@ async function filterInvalid() {
     let invalidCount = 0;
     let retainedOnErrorCount = 0;
 
+
     for (const account of infoAccounts) {
         if (!account?.token) {
             console.warn("[bg] Skipping account without token during validation:", account);
             continue;
         }
-
         const checkResult = await checkTokenAndGetInfo(account.token);
         const normalizedResult = checkResult || { status: 'error', message: 'Unknown validation failure' };
 
@@ -830,6 +831,7 @@ async function filterInvalid() {
         } else if (normalizedResult.status === 'invalid') {
             invalidCount++;
             console.log(`Token invalid: ${maskToken(account.token)} (${normalizedResult.message || 'unauthorized'})`);
+
         } else {
             retainedOnErrorCount++;
             const retryHint = normalizedResult.retryAfter ? `, retry-after: ${normalizedResult.retryAfter}` : '';
